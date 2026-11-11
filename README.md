@@ -13,6 +13,8 @@
 		<a href="#technical-architecture">Technical Deep Dive</a> •
 		<a href="#faq">FAQ</a>
 	</p>
+	<br/>
+	<img src="assets/preview.jpg" alt="mpv HTTP Cache OSD preview showing 8.0% cached (1.72 GB)" width="760"/>
 </div>
 
 ---
