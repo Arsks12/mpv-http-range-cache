@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.log
+server.json
+proxy.lock
+.DS_Store
+.pytest_cache/
+*.tmp
+
