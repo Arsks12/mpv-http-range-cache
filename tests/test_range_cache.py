@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 
 import aiohttp
@@ -173,6 +174,16 @@ async def run_async_proxy_tests(tmp: str):
                 wl_b = await rwl.json()
                 assert wl_b["resume"] is True and abs(wl_b["start"] - 42.5) < 0.01
 
+            # Concurrent health/status + stream requests complete cleanly without blocking event loop
+            r_h, r_s, r_st = await asyncio.gather(
+                cli.get(f"{base}/__health"),
+                cli.get(f"{base}/__status", params={"url": url_a}),
+                cli.get(f"{base}/stream", params={"url": url_a}, headers={"Range": "bytes=0-1023"}),
+            )
+            async with r_h, r_s, r_st:
+                assert r_h.status == 200 and r_s.status == 200
+                assert r_st.status == 206 and (await r_st.read()) == payload[:1024]
+
             async with cli.get(f"{base}/stream", params={"url": f"http://127.0.0.1:{up_port}/fail404"}) as r404:
                 assert r404.status == 404
             async with cli.get(f"{base}/stream", params={"url": url_a}, headers={"Range": f"bytes={len(payload) + 10}-"}) as r416:
@@ -288,6 +299,21 @@ def test_mpv_integration(tmp: str):
         with open(os.path.join(entry_dir, "cache.meta.json"), "r", encoding="utf-8") as f:
             meta = json.load(f)
         assert meta["total_size"] == len(mkv_bytes) and meta["cached_bytes"] > 0
+
+        # Trigger quit-watch-later mid-playback to verify async detached end-file watch_later sync
+        quit_lua = os.path.join(tmp, "quit_wl.lua")
+        with open(quit_lua, "w", encoding="utf-8") as f:
+            f.write("local mp = require('mp')\nmp.register_event('file-loaded', function() mp.add_timeout(0.4, function() mp.command('quit-watch-later') end) end)\n")
+        r_wl = subprocess.run(
+            common_args + ["--start=2.0", f"--script={quit_lua}", f"--log-file={tmp}/mpv_wl.log", url1],
+            timeout=20,
+        )
+        assert r_wl.returncode == 0
+        wl_backup = os.path.join(entry_dir, "cache.watch_later")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not os.path.exists(wl_backup):
+            time.sleep(0.05)
+        assert os.path.exists(wl_backup), "Expected async end-file watch_later backup on quit"
 
         up_state["requests"].clear()
         up_state["bytes_sent"] = 0

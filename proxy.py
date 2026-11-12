@@ -489,6 +489,24 @@ class CacheEntry:
         with self.lock:
             return plan_segments(self.ranges, req_start, req_end)
 
+    def plan_state(self) -> Tuple[Optional[int], str, bool]:
+        with self.lock:
+            can_plan = (
+                self.total_size is not None
+                and self.total_size > 0
+                and (self.accept_ranges or total_cached_bytes(self.ranges) >= self.total_size)
+            )
+            return self.total_size, self.content_type, can_plan
+
+    def head_info(self) -> Tuple[Optional[int], str, bool]:
+        with self.lock:
+            return self.total_size, self.content_type, self.accept_ranges
+
+    def set_head_hash(self, head_hash: str) -> None:
+        with self.lock:
+            self.head_hash = head_hash
+            self._dirty_meta = True
+
     def info(self) -> dict:
         with self.lock:
             cached = total_cached_bytes(self.ranges)
@@ -605,6 +623,25 @@ class CacheManager:
                         entry.url = url
                 entry.add_known_url(url)
             return entry
+
+    def acquire_entry(self, url: str) -> CacheEntry:
+        entry = self.get_entry(url)
+        entry.acquire_user()
+        return entry
+
+    def check_dedup_ready(self, entry: CacheEntry, total_size: Optional[int]) -> bool:
+        if not total_size or total_size <= 0:
+            return False
+        with entry.lock:
+            if entry.ranges:
+                return False
+        return self.has_candidates_for_size(total_size, exclude_key=entry.key)
+
+    def link_and_acquire_alias(self, alias_key: str, target: CacheEntry, alias_url: str) -> str:
+        self.link_alias(alias_key, target.key, alias_url)
+        with target.lock:
+            target.acquire_user()
+            return target.content_type
 
     def _size_candidates(self, total_size: int, exclude_key: Optional[str]) -> List[CacheEntry]:
         if not self.match_by_content or total_size <= 0:
@@ -904,7 +941,7 @@ class AsyncRangeProxy:
         )
 
     @staticmethod
-    def _record_probe_meta(entry: CacheEntry, resp: aiohttp.ClientResponse) -> None:
+    def _record_probe_meta(entry: CacheEntry, resp: aiohttp.ClientResponse, head_hash: Optional[str] = None) -> None:
         ct = resp.headers.get("Content-Type", "application/octet-stream")
         if is_non_cacheable_ct(ct):
             return
@@ -926,6 +963,8 @@ class AsyncRangeProxy:
         if not entry.update_metadata(**meta_kw):
             entry.invalidate()
             entry.update_metadata(**meta_kw)
+        if head_hash:
+            entry.set_head_hash(head_hash)
         entry.save_meta(force=True)
 
     @staticmethod
@@ -950,13 +989,15 @@ class AsyncRangeProxy:
         return web.json_response({"status": "ok", "pid": os.getpid(), "port": self.port})
 
     async def handle_status(self, request: web.Request) -> web.Response:
-        return web.json_response(self.manager.stats(request.query.get("url")))
+        stats = await asyncio.to_thread(self.manager.stats, request.query.get("url"))
+        return web.json_response(stats)
 
     async def handle_get_watch_later(self, request: web.Request) -> web.Response:
         target_url = request.query.get("url")
         if not target_url:
             return web.json_response({"error": "Missing url"}, status=400)
-        return web.json_response(self.manager.get_watch_later(target_url, request.query.get("wl_dir")))
+        res = await asyncio.to_thread(self.manager.get_watch_later, target_url, request.query.get("wl_dir"))
+        return web.json_response(res)
 
     async def handle_post_watch_later(self, request: web.Request) -> web.Response:
         target_url = request.query.get("url")
@@ -969,8 +1010,9 @@ class AsyncRangeProxy:
                 pos_val = float(pos_str)
             except ValueError:
                 pass
-        res = self.manager.sync_watch_later(
-            target_url, request.query.get("wl_dir"), pos_val, request.query.get("reason", "")
+        res = await asyncio.to_thread(
+            self.manager.sync_watch_later,
+            target_url, request.query.get("wl_dir"), pos_val, request.query.get("reason", ""),
         )
         return web.json_response(res)
 
@@ -978,22 +1020,24 @@ class AsyncRangeProxy:
         target_url = request.query.get("url")
         if not target_url:
             return web.json_response({"error": "Missing url"}, status=400)
-        return web.json_response({"cleared": self.manager.clear_url(target_url)})
+        cleared = await asyncio.to_thread(self.manager.clear_url, target_url)
+        return web.json_response({"cleared": cleared})
 
     async def handle_clear_all(self, request: web.Request) -> web.Response:
-        return web.json_response({"cleared_entries": self.manager.clear_all()})
+        count = await asyncio.to_thread(self.manager.clear_all)
+        return web.json_response({"cleared_entries": count})
 
     async def handle_stream_head(self, request: web.Request) -> web.Response:
         target_url, upstream_headers, proxy_url, tls_verify, timeout_sec = self._extract_upstream_config(request)
         if not target_url:
             return web.Response(status=400, text="Missing url")
-        entry = self.manager.get_entry(target_url)
-        with entry.lock:
-            if entry.total_size is not None:
-                return web.Response(
-                    status=200,
-                    headers=self._media_headers(entry.content_type, entry.total_size, entry.accept_ranges),
-                )
+        entry = await asyncio.to_thread(self.manager.get_entry, target_url)
+        known_total, known_ct, known_ar = await asyncio.to_thread(entry.head_info)
+        if known_total is not None:
+            return web.Response(
+                status=200,
+                headers=self._media_headers(known_ct, known_total, known_ar),
+            )
         try:
             resp = await self._fetch_upstream("HEAD", target_url, upstream_headers, proxy_url, tls_verify, timeout_sec)
             try:
@@ -1002,14 +1046,15 @@ class AsyncRangeProxy:
                     resp = await self._fetch_upstream(
                         "GET", target_url, upstream_headers, proxy_url, tls_verify, timeout_sec, range_header="bytes=0-0"
                     )
-                self._record_probe_meta(entry, resp)
+                await asyncio.to_thread(self._record_probe_meta, entry, resp)
+                known_total, _, known_ar = await asyncio.to_thread(entry.head_info)
                 status = 200 if resp.status in (200, 206) else resp.status
                 return web.Response(
                     status=status,
                     headers=self._media_headers(
                         resp.headers.get("Content-Type", "application/octet-stream"),
-                        entry.total_size,
-                        entry.accept_ranges,
+                        known_total,
+                        known_ar,
                     ),
                 )
             finally:
@@ -1021,14 +1066,13 @@ class AsyncRangeProxy:
         target_url, upstream_headers, proxy_url, tls_verify, timeout_sec = self._extract_upstream_config(request)
         if not target_url:
             return web.Response(status=400, text="Missing url parameter")
-        entry = self.manager.get_entry(target_url)
-        entry.acquire_user()
+        entry = await asyncio.to_thread(self.manager.acquire_entry, target_url)
         try:
             return await self._handle_stream_for_entry(
                 request, entry, target_url, upstream_headers, proxy_url, tls_verify, timeout_sec
             )
         finally:
-            entry.release_user()
+            await asyncio.to_thread(entry.release_user)
 
     async def _handle_stream_for_entry(
         self,
@@ -1041,12 +1085,7 @@ class AsyncRangeProxy:
         timeout_sec: float,
     ) -> web.StreamResponse:
         client_range_hdr = request.headers.get("Range")
-        with entry.lock:
-            known_total = entry.total_size
-            known_ct = entry.content_type
-            can_plan = known_total is not None and known_total > 0 and (
-                entry.accept_ranges or total_cached_bytes(entry.ranges) >= known_total
-            )
+        known_total, known_ct, can_plan = await asyncio.to_thread(entry.plan_state)
 
         if can_plan:
             try:
@@ -1058,7 +1097,7 @@ class AsyncRangeProxy:
                     request, entry, has_range, req_start, req_end, known_total, known_ct,
                     upstream_headers, proxy_url, tls_verify, timeout_sec,
                 )
-                self.manager.maybe_evict(protect_key=entry.key)
+                await asyncio.to_thread(self.manager.maybe_evict, protect_key=entry.key)
                 return resp
 
         try:
@@ -1093,7 +1132,7 @@ class AsyncRangeProxy:
             if up_resp.status == 206:
                 cr = parse_content_range(up_resp.headers.get("Content-Range", ""))
                 if not cr:
-                    self._record_probe_meta(entry, up_resp)
+                    await asyncio.to_thread(self._record_probe_meta, entry, up_resp)
                     return await self._passthrough_response(request, up_resp, send_as_200=(not has_range))
                 u_start, u_end, u_total = cr
                 stream_max_bytes: Optional[int] = u_end - u_start + 1
@@ -1106,10 +1145,7 @@ class AsyncRangeProxy:
 
             # Content deduplication: match exact total_size + SHA-256 of first 64 KB across URLs
             head_buf, head_hash = b"", None
-            if (
-                u_start == 0 and u_total and not entry.ranges
-                and self.manager.has_candidates_for_size(u_total, exclude_key=entry.key)
-            ):
+            if u_start == 0 and await asyncio.to_thread(self.manager.check_dedup_ready, entry, u_total):
                 need_len = min(HEAD_HASH_BYTES, u_total)
                 chunks, got = [], 0
                 while got < need_len:
@@ -1121,37 +1157,34 @@ class AsyncRangeProxy:
                 head_buf = b"".join(chunks)
                 if len(head_buf) == need_len:
                     head_hash = hashlib.sha256(head_buf).hexdigest()
-                    matched = self.manager.find_matching_entry(u_total, head_hash, exclude_key=entry.key)
+                    matched = await asyncio.to_thread(
+                        self.manager.find_matching_entry, u_total, head_hash, exclude_key=entry.key
+                    )
                     if matched is not None:
                         up_resp.close()
                         close_up_in_finally = False
-                        self.manager.link_alias(entry.key, matched.key, target_url)
-                        matched.acquire_user()
+                        m_ct = (await asyncio.to_thread(
+                            self.manager.link_and_acquire_alias, entry.key, matched, target_url
+                        )) or ct
                         try:
                             m_has_range, m_start, m_end = parse_range_header(client_range_hdr, u_total)
                             if m_start is None or m_end is None:
                                 m_start, m_end = 0, u_total - 1
-                            with matched.lock:
-                                m_ct = matched.content_type or ct
                             resp = await self._serve_known_range(
                                 request, matched, m_has_range, m_start, m_end, u_total, m_ct,
                                 upstream_headers, proxy_url, tls_verify, timeout_sec,
                             )
                         finally:
-                            matched.release_user()
-                        self.manager.maybe_evict(protect_key=matched.key)
+                            await asyncio.to_thread(matched.release_user)
+                        await asyncio.to_thread(self.manager.maybe_evict, protect_key=matched.key)
                         return resp
 
-            self._record_probe_meta(entry, up_resp)
-            if head_hash:
-                with entry.lock:
-                    entry.head_hash = head_hash
-                    entry._dirty_meta = True
+            await asyncio.to_thread(self._record_probe_meta, entry, up_resp, head_hash=head_hash)
 
             # Hand off cold capped probe into full parallel _serve_known_range seamlessly
             if probe_capped and up_resp.status == 206 and u_start == 0 and u_total and u_end < u_total - 1:
                 if head_buf:
-                    entry.write_chunk(0, head_buf)
+                    await asyncio.to_thread(entry.write_chunk, 0, head_buf)
                     u_start = len(head_buf)
                     stream_max_bytes = max(0, (u_end - u_start + 1))
                 close_up_in_finally = False
@@ -1160,15 +1193,16 @@ class AsyncRangeProxy:
                     upstream_headers, proxy_url, tls_verify, timeout_sec,
                     cold_part0=(up_resp, head_buf, u_start, u_end, stream_max_bytes),
                 )
-                self.manager.maybe_evict(protect_key=entry.key)
+                await asyncio.to_thread(self.manager.maybe_evict, protect_key=entry.key)
                 return resp
 
+            _, _, accept_ranges_flag = await asyncio.to_thread(entry.head_info)
             if up_resp.status == 206:
                 cr_hdr = f"bytes {u_start}-{u_end}/{u_total if u_total is not None else '*'}" if has_range else None
                 hdrs = self._media_headers(ct, u_end - u_start + 1, True, cr_hdr)
                 status = 206 if has_range else 200
             else:
-                hdrs = self._media_headers(ct, u_total, entry.accept_ranges)
+                hdrs = self._media_headers(ct, u_total, accept_ranges_flag)
                 status = 200
 
             client_resp = web.StreamResponse(status=status, headers=hdrs)
@@ -1178,7 +1212,7 @@ class AsyncRangeProxy:
 
             try:
                 if head_buf:
-                    entry.write_chunk(u_start, head_buf)
+                    await asyncio.to_thread(entry.write_chunk, u_start, head_buf)
                     await client_resp.write(head_buf)
                     if stream_max_bytes is not None:
                         stream_max_bytes = max(0, stream_max_bytes - len(head_buf))
@@ -1193,8 +1227,8 @@ class AsyncRangeProxy:
         finally:
             if close_up_in_finally:
                 up_resp.close()
-            entry.save_meta(force=True)
-            self.manager.maybe_evict(protect_key=entry.key)
+            await asyncio.to_thread(entry.save_meta, force=True)
+            await asyncio.to_thread(self.manager.maybe_evict, protect_key=entry.key)
 
     async def _passthrough_response(
         self, request: web.Request, up_resp: aiohttp.ClientResponse, send_as_200: bool = False
@@ -1239,7 +1273,7 @@ class AsyncRangeProxy:
                     if len(chunk) > remaining:
                         chunk = chunk[:remaining]
                     remaining -= len(chunk)
-                entry.write_chunk(offset, chunk)
+                await asyncio.to_thread(entry.write_chunk, offset, chunk)
                 offset += len(chunk)
                 if to_skip >= len(chunk):
                     to_skip -= len(chunk)
@@ -1274,14 +1308,15 @@ class AsyncRangeProxy:
             segments = [("net", 0, req_end)]
         else:
             up0, head_buf, u0_start, u0_end = None, b"", 0, 0
-            segments = entry.snapshot_plan(req_start, req_end)
+            segments = await asyncio.to_thread(entry.snapshot_plan, req_start, req_end)
 
         # Prefetch first network segment before committing headers so upstream 4xx/5xx propagate
         prefetched_resp: Optional[aiohttp.ClientResponse] = up0
         if prefetched_resp is None and segments and segments[0][0] == "net":
             _, seg_s, seg_e = segments[0]
+            _, _, accept_ranges_flag = await asyncio.to_thread(entry.head_info)
             first_end = min(seg_e, seg_s + self.part_size - 1) if (
-                self.connections > 1 and entry.accept_ranges and (seg_e - seg_s + 1) > self.part_size
+                self.connections > 1 and accept_ranges_flag and (seg_e - seg_s + 1) > self.part_size
             ) else seg_e
             rng = f"bytes={seg_s}-" if first_end == total_size - 1 else f"bytes={seg_s}-{first_end}"
             try:
@@ -1292,7 +1327,7 @@ class AsyncRangeProxy:
                 return web.Response(status=502, text=f"Upstream error: {e}")
             if prefetched_resp.status not in (200, 206):
                 try:
-                    return await self._passthrough_response(prefetched_resp)
+                    return await self._passthrough_response(request, prefetched_resp)
                 finally:
                     prefetched_resp.close()
 
@@ -1300,14 +1335,16 @@ class AsyncRangeProxy:
         hdrs = self._media_headers(content_type, req_end - req_start + 1, True, cr_hdr)
         client_resp = web.StreamResponse(status=206 if has_range else 200, headers=hdrs)
         await client_resp.prepare(request)
-        entry.touch()
+        await asyncio.to_thread(entry.touch)
 
         try:
             for idx, (kind, seg_s, seg_e) in enumerate(segments):
                 if kind == "cache":
                     pos = seg_s
                     while pos <= seg_e:
-                        data = entry.read_chunk(pos, min(self.chunk_size, seg_e - pos + 1))
+                        data = await asyncio.to_thread(
+                            entry.read_chunk, pos, min(self.chunk_size, seg_e - pos + 1)
+                        )
                         if not data:
                             await self._fetch_net_segment(
                                 client_resp, entry, pos, seg_e, total_size,
@@ -1316,7 +1353,6 @@ class AsyncRangeProxy:
                             break
                         await client_resp.write(data)
                         pos += len(data)
-                        await asyncio.sleep(0)
                 else:
                     resp0 = prefetched_resp if idx == 0 else None
                     c_info = (head_buf, u0_start, u0_end) if (idx == 0 and cold_part0 is not None) else None
@@ -1335,7 +1371,7 @@ class AsyncRangeProxy:
         finally:
             if prefetched_resp is not None:
                 prefetched_resp.close()
-            entry.save_meta(force=True)
+            await asyncio.to_thread(entry.save_meta, force=True)
         return client_resp
 
     async def _fetch_net_segment(
@@ -1353,9 +1389,10 @@ class AsyncRangeProxy:
         cold_part0_info: Optional[Tuple[bytes, int, int]] = None,
     ) -> bool:
         total_needed = seg_e - seg_s + 1
+        _, _, accept_ranges_flag = await asyncio.to_thread(entry.head_info)
         use_parallel = (
             self.connections > 1
-            and entry.accept_ranges
+            and accept_ranges_flag
             and (cold_part0_info is not None or total_needed > self.part_size)
             and (existing_resp is None or existing_resp.status == 206)
         )
@@ -1382,7 +1419,7 @@ class AsyncRangeProxy:
                 if cr:
                     u_start, u_end, u_total = cr
                     if u_total is not None and u_total != total_size:
-                        entry.invalidate()
+                        await asyncio.to_thread(entry.invalidate)
                         return False
                     if u_start > seg_s:
                         return False
@@ -1480,7 +1517,7 @@ class AsyncRangeProxy:
                         cr = parse_content_range(resp.headers.get("Content-Range", ""))
                         if cr:
                             if cr[2] is not None and cr[2] != total_size:
-                                entry.invalidate()
+                                await asyncio.to_thread(entry.invalidate)
                                 return False
                             if cr[0] > read_start:
                                 return False
@@ -1499,7 +1536,7 @@ class AsyncRangeProxy:
                         if len(chunk) > remaining:
                             chunk = chunk[:remaining]
                         remaining -= len(chunk)
-                        entry.write_chunk(off, chunk)
+                        await asyncio.to_thread(entry.write_chunk, off, chunk)
                         off += len(chunk)
                         if to_skip >= len(chunk):
                             to_skip -= len(chunk)
@@ -1638,7 +1675,11 @@ async def run_server(args, manager: CacheManager, server_info_path: str) -> None
 
     actual_port = site._server.sockets[0].getsockname()[1]
     proxy_srv.port = actual_port
-    _atomic_write_json(server_info_path, {"pid": os.getpid(), "port": actual_port, "started_at": time.time()})
+    await asyncio.to_thread(
+        _atomic_write_json,
+        server_info_path,
+        {"pid": os.getpid(), "port": actual_port, "started_at": time.time()},
+    )
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1671,7 +1712,7 @@ async def run_server(args, manager: CacheManager, server_info_path: str) -> None
     finally:
         if watchdog_task is not None and not watchdog_task.done():
             watchdog_task.cancel()
-        manager.flush_all()
+        await asyncio.to_thread(manager.flush_all)
         await proxy_srv.close_session()
         await runner.cleanup()
 

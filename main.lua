@@ -28,8 +28,9 @@ local cache_dir = mp.command_native({"expand-path", opts.cache_dir})
 local server_info_path = utils.join_path(cache_dir, "server.json")
 
 local runtime_enabled = opts.enabled
-local resolved_python, has_curl, active_port = nil, nil, nil
-local last_health_at, starting_proxy, pending_waiters = -1000, false, {}
+local resolved_python, probing_python, py_waiters = nil, false, {}
+local has_curl, probing_curl, curl_waiters = nil, false, {}
+local active_port, last_health_at, starting_proxy, pending_waiters = nil, -1000, false, {}
 local active_load_state, current_loaded_url, last_time_pos, last_synced_pos, last_orig_url = nil, nil, nil, nil, nil
 local last_proxied_by_path = {}
 
@@ -67,56 +68,95 @@ local function is_cacheable_url(url)
     return not (path_part:match("%.m3u8?$") or path_part:match("%.mpd$") or path_part:match("%.pls$"))
 end
 
-local function run_subproc(args, cb)
-    local req = { name = "subprocess", playback_only = false, capture_stdout = true, capture_stderr = true, args = args }
-    if not cb then return mp.command_native(req) end
+local function run_subproc(args, cb, detach)
+    local req = {
+        name = "subprocess",
+        playback_only = false,
+        detach = detach or false,
+        capture_stdout = not detach,
+        capture_stderr = not detach,
+        args = args,
+    }
     mp.command_native_async(req, function(ok, res)
-        cb(ok and res and res.status == 0, (res and res.stdout) or "")
+        if cb then cb(ok and res and res.status == 0, (res and res.stdout) or "") end
     end)
 end
 
-local function detect_python()
-    if resolved_python then return resolved_python end
+local function detect_python(cb)
+    if resolved_python then return cb(resolved_python) end
     if opts.python_path ~= "" and opts.python_path ~= "auto" then
         resolved_python = opts.python_path
-        return resolved_python
+        return cb(resolved_python)
     end
-    for _, cmd in ipairs(IS_WIN and { "pythonw", "python", "python3" } or { "python3", "python" }) do
-        local res = run_subproc({ cmd, "-c", "import aiohttp; print('ok')" })
-        if res and res.status == 0 and (res.stdout or ""):match("ok") then
-            resolved_python = cmd
-            return cmd
-        end
+    table.insert(py_waiters, cb)
+    if probing_python then return end
+    probing_python = true
+
+    local candidates = IS_WIN and { "pythonw", "python", "python3" } or { "python3", "python" }
+    local function finish(py)
+        probing_python = false
+        resolved_python = py
+        local waiters = py_waiters
+        py_waiters = {}
+        for _, w in ipairs(waiters) do w(py) end
     end
-    return nil
+    local function try_next(idx)
+        if idx > #candidates then return finish(nil) end
+        local cmd = candidates[idx]
+        run_subproc({ cmd, "-c", "import aiohttp; print('ok')" }, function(ok, stdout)
+            if ok and stdout:match("ok") then
+                finish(cmd)
+            else
+                try_next(idx + 1)
+            end
+        end)
+    end
+    try_next(1)
 end
 
-local function http_req(method, port, path_q, cb)
+local function detect_curl(cb)
+    if has_curl ~= nil then return cb(has_curl) end
+    table.insert(curl_waiters, cb)
+    if probing_curl then return end
+    probing_curl = true
+    run_subproc({ "curl", "--version" }, function(ok)
+        probing_curl = false
+        has_curl = ok
+        local waiters = curl_waiters
+        curl_waiters = {}
+        for _, w in ipairs(waiters) do w(ok) end
+    end)
+end
+
+local function http_req(method, port, path_q, cb, detach)
     local url = "http://127.0.0.1:" .. tostring(port) .. path_q
-    if has_curl == nil then
-        local r = run_subproc({ "curl", "--version" })
-        has_curl = (r ~= nil and r.status == 0)
+    if detach and IS_WIN then
+        return detect_python(function(py)
+            if not py then
+                if cb then cb(false, "") end
+                return
+            end
+            local code = "import urllib.request; urllib.request.urlopen(urllib.request.Request('"
+                .. url .. "', method='" .. method .. "'), timeout=2).read()"
+            run_subproc({ py, "-c", code }, cb, py:lower():match("pythonw") ~= nil)
+        end)
     end
-    local args
-    if has_curl then
-        args = { "curl", "-sf", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2", "-X", method, url }
-    else
-        local py = detect_python()
-        if not py then
-            if cb then cb(false, "") end
-            return false, ""
+    detect_curl(function(curl_ok)
+        if curl_ok then
+            local args = { "curl", "-sf", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2", "-X", method, url }
+            return run_subproc(args, cb, detach)
         end
-        local py_cmd = IS_WIN and (py == "pythonw" and "python" or py) or py
-        local code = "import urllib.request; print(urllib.request.urlopen(urllib.request.Request('"
-            .. url .. "', method='" .. method .. "'), timeout=2).read().decode('utf-8'))"
-        args = { py_cmd, "-c", code }
-    end
-    if cb then
-        run_subproc(args, cb)
-        return
-    end
-    local res = run_subproc(args)
-    return (res ~= nil and res.status == 0), (res and res.stdout or "")
+        detect_python(function(py)
+            if not py then
+                if cb then cb(false, "") end
+                return
+            end
+            local py_cmd = IS_WIN and (not detach and py == "pythonw" and "python" or py) or py
+            local code = "import urllib.request; print(urllib.request.urlopen(urllib.request.Request('"
+                .. url .. "', method='" .. method .. "'), timeout=2).read().decode('utf-8'))"
+            run_subproc({ py_cmd, "-c", code }, cb, detach and (not IS_WIN or py_cmd:lower():match("pythonw") ~= nil))
+        end)
+    end)
 end
 
 local function read_server_port()
@@ -134,34 +174,36 @@ local function finish_waiters(port)
     for _, cb in ipairs(waiters) do cb(port) end
 end
 
-local function spawn_proxy()
-    local py = detect_python()
-    if not py then
-        msg.error("Python with 'aiohttp' not found; HTTP range caching disabled")
-        return false
-    end
-    local args = {
-        py, proxy_script,
-        "--cache-dir", cache_dir,
-        "--idle-timeout", tostring(opts.idle_timeout),
-        "--max-cache-mb", tostring(opts.max_cache_size_mb),
-        "--chunk-size", tostring(opts.chunk_size),
-        "--connections", tostring(opts.connections),
-        "--part-size-kb", tostring(opts.part_size_kb),
-        "--flush-kb", tostring(opts.flush_interval_kb),
-        "--ignore-params", opts.ignore_query_params or "",
-    }
-    if not opts.match_by_content then table.insert(args, "--no-match-by-content") end
-    if opts.debug_log then
-        table.insert(args, "--log-file")
-        table.insert(args, utils.join_path(cache_dir, "proxy.log"))
-    end
-    local res = mp.command_native({ name = "subprocess", playback_only = false, detach = true, args = args })
-    if not res or res.status ~= 0 then
-        msg.error("Failed to launch proxy.py: " .. tostring(res and res.error_string))
-        return false
-    end
-    return true
+local function spawn_proxy(cb)
+    detect_python(function(py)
+        if not py then
+            msg.error("Python with 'aiohttp' not found; HTTP range caching disabled")
+            return cb(false)
+        end
+        local args = {
+            py, proxy_script,
+            "--cache-dir", cache_dir,
+            "--idle-timeout", tostring(opts.idle_timeout),
+            "--max-cache-mb", tostring(opts.max_cache_size_mb),
+            "--chunk-size", tostring(opts.chunk_size),
+            "--connections", tostring(opts.connections),
+            "--part-size-kb", tostring(opts.part_size_kb),
+            "--flush-kb", tostring(opts.flush_interval_kb),
+            "--ignore-params", opts.ignore_query_params or "",
+        }
+        if not opts.match_by_content then table.insert(args, "--no-match-by-content") end
+        if opts.debug_log then
+            table.insert(args, "--log-file")
+            table.insert(args, utils.join_path(cache_dir, "proxy.log"))
+        end
+        mp.command_native_async({ name = "subprocess", playback_only = false, detach = true, args = args }, function(ok, res)
+            if not ok or not res or res.status ~= 0 then
+                msg.error("Failed to launch proxy.py: " .. tostring(res and res.error_string))
+                return cb(false)
+            end
+            cb(true)
+        end)
+    end)
 end
 
 local function poll_until_ready(attempts)
@@ -192,7 +234,9 @@ local function ensure_proxy(cb)
     starting_proxy = true
 
     local function launch()
-        if spawn_proxy() then mp.add_timeout(0.05, function() poll_until_ready(80) end) else finish_waiters(nil) end
+        spawn_proxy(function(ok)
+            if ok then mp.add_timeout(0.05, function() poll_until_ready(80) end) else finish_waiters(nil) end
+        end)
     end
     local port = active_port or read_server_port()
     if not port then return launch() end
@@ -254,14 +298,14 @@ mp.add_hook("on_load_fail", 5, function()
     end
 end)
 
-local function sync_watch_later(url, reason, sync_mode)
+local function sync_watch_later(url, reason, detach)
     if not url or not active_port or not mp.get_property_bool("save-position-on-quit", false) then return end
     local pos = mp.get_property_number("time-pos") or last_time_pos
     local q = "/__watch_later?url=" .. url_encode(url)
         .. "&wl_dir=" .. url_encode(get_watch_later_dir())
         .. "&reason=" .. url_encode(reason or "")
         .. ((pos and pos > 0) and ("&pos=" .. string.format("%.6f", pos)) or "")
-    http_req("POST", active_port, q, sync_mode and nil or function() end)
+    http_req("POST", active_port, q, function() end, detach)
 end
 
 mp.observe_property("time-pos", "number", function(_, val)
@@ -269,7 +313,7 @@ mp.observe_property("time-pos", "number", function(_, val)
     last_time_pos = val
     if last_synced_pos == nil or math.abs(val - last_synced_pos) >= 15 then
         last_synced_pos = val
-        sync_watch_later(current_loaded_url, "periodic", false)
+        sync_watch_later(current_loaded_url, "periodic")
     end
 end)
 
