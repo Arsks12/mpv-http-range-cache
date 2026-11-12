@@ -1,18 +1,16 @@
 import argparse
+import asyncio
 import hashlib
-import http.server
-import json
 import os
 import re
 import shutil
-import socketserver
 import subprocess
 import sys
 import tempfile
-import threading
 import urllib.parse
 
-import requests
+import aiohttp
+from aiohttp import web
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_LUA = os.path.join(REPO_ROOT, "main.lua")
@@ -20,74 +18,45 @@ sys.path.insert(0, REPO_ROOT)
 import proxy  # noqa: E402
 
 
-class RangeRequestHandler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def _serve_file(self, send_body: bool):
-        st = self.server.state
-        path = urllib.parse.urlsplit(self.path).path
-        st["requests"].append((self.command, path, dict(self.headers)))
-
-        if path == "/fail404" or (st.get("block_paths") and path in st["block_paths"]):
-            self.send_response(404 if path == "/fail404" else 503)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        data = st["files"].get(path)
+def make_upstream_app(state: dict) -> web.Application:
+    async def handle(request: web.Request) -> web.Response:
+        path = request.path
+        state["requests"].append((request.method, path, dict(request.headers)))
+        if path == "/fail404" or (state.get("block_paths") and path in state["block_paths"]):
+            return web.Response(status=404 if path == "/fail404" else 503)
+        data = state["files"].get(path)
         if data is None:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+            return web.Response(status=404)
 
         total = len(data)
-        rng = self.headers.get("Range")
-        if rng and st.get("support_range", True):
+        rng = request.headers.get("Range")
+        send_body = request.method != "HEAD"
+        if rng and state.get("support_range", True):
             m = re.match(r"^bytes=(\d*)-(\d*)$", rng.strip())
             if m and (m.group(1) or m.group(2)):
                 s = int(m.group(1)) if m.group(1) else max(0, total - int(m.group(2)))
                 e = min(int(m.group(2)) if m.group(2) else total - 1, total - 1)
                 if s >= total or e < s:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{total}")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
+                    return web.Response(status=416, headers={"Content-Range": f"bytes */{total}"})
                 chunk = data[s : e + 1]
-                st["bytes_sent"] += len(chunk)
-                self.send_response(206)
-                self.send_header("Content-Type", "video/x-matroska")
-                self.send_header("Accept-Ranges", "bytes")
-                self.send_header("Content-Range", f"bytes {s}-{e}/{total}")
-                self.send_header("Content-Length", str(len(chunk)))
-                self.end_headers()
-                if send_body:
-                    self.wfile.write(chunk)
-                return
+                state["bytes_sent"] += len(chunk)
+                hdrs = {
+                    "Content-Type": "video/x-matroska",
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": f"bytes {s}-{e}/{total}",
+                    "Content-Length": str(len(chunk)),
+                }
+                return web.Response(status=206, headers=hdrs, body=chunk if send_body else b"")
 
-        st["bytes_sent"] += total
-        self.send_response(200)
-        self.send_header("Content-Type", "video/x-matroska")
-        if st.get("support_range", True):
-            self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(total))
-        self.end_headers()
-        if send_body:
-            self.wfile.write(data)
+        state["bytes_sent"] += total
+        hdrs = {"Content-Type": "video/x-matroska", "Content-Length": str(total)}
+        if state.get("support_range", True):
+            hdrs["Accept-Ranges"] = "bytes"
+        return web.Response(status=200, headers=hdrs, body=data if send_body else b"")
 
-    def do_HEAD(self):
-        self._serve_file(False)
-
-    def do_GET(self):
-        self._serve_file(True)
-
-
-class ThreadedHTTP(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handle)
+    return app
 
 
 def test_unit_helpers(tmp: str):
@@ -98,8 +67,7 @@ def test_unit_helpers(tmp: str):
     ]
     assert proxy.canonical_url("http://x/v.mkv?token=abc&id=1", {"token"}) == "http://x/v.mkv?id=1"
     assert proxy.extract_safe_dirname("http://x/a/b/CON.mkv") == "_CON.mkv"
-    long_name = "a" * 130 + ".mkv"
-    d = proxy.extract_safe_dirname(f"http://x/{long_name}")
+    d = proxy.extract_safe_dirname(f"http://x/{'a' * 130}.mkv")
     assert len(d) <= 110 and d.endswith(".mkv")
 
     cdir = os.path.join(tmp, "unit_cache")
@@ -115,22 +83,22 @@ def test_unit_helpers(tmp: str):
     # Legacy flat-file migration test
     mig_dir = os.path.join(tmp, "mig_cache")
     os.makedirs(mig_dir, exist_ok=True)
-    orig_url = "http://old/video.mkv"
+    orig_url, alias_url = "http://old/video.mkv", "http://mirror/video.mkv"
     orig_key = proxy.url_cache_key(orig_url, set())
-    alias_url = "http://mirror/video.mkv"
     alias_key = proxy.url_cache_key(alias_url, set())
     with open(os.path.join(mig_dir, f"{orig_key}.data"), "wb") as f:
         f.write(b"Z" * 1024)
     with open(os.path.join(mig_dir, f"{orig_key}.meta.json"), "w", encoding="utf-8") as f:
+        import json
         json.dump({"key": orig_key, "url": orig_url, "total_size": 1024, "ranges": [[0, 1023]]}, f)
     with open(os.path.join(mig_dir, f"{orig_key}.watch_later"), "w", encoding="utf-8") as f:
         f.write("start=12.5\n")
     with open(os.path.join(mig_dir, f"{alias_key}.alias.json"), "w", encoding="utf-8") as f:
+        import json
         json.dump({"target_key": orig_key, "url": alias_url}, f)
 
     mig_mgr = proxy.CacheManager(mig_dir, max_cache_mb=0, flush_kb=64, ignore_params=set())
-    assert orig_key in mig_mgr.entries
-    assert mig_mgr.aliases.get(alias_key) == orig_key
+    assert orig_key in mig_mgr.entries and mig_mgr.aliases.get(alias_key) == orig_key
     me = mig_mgr.get_entry(alias_url)
     assert me.key == orig_key and me.head_hash == hashlib.sha256(b"Z" * 1024).hexdigest()
     assert not os.path.exists(os.path.join(mig_dir, f"{alias_key}.alias.json"))
@@ -138,67 +106,142 @@ def test_unit_helpers(tmp: str):
     print("[PASS] unit helpers & migration")
 
 
-def test_proxy_http_and_dedup(tmp: str):
-    payload = os.urandom(200_000)
+async def run_async_proxy_tests(tmp: str):
+    payload = os.urandom(1_300_000)  # > 4 x 256 KB parts to verify parallel split downloading
     up_state = {"files": {"/a/Test.Movie.mkv": payload, "/b/Mirror.mkv": payload}, "requests": [], "bytes_sent": 0, "support_range": True}
-    up_srv = ThreadedHTTP(("127.0.0.1", 0), RangeRequestHandler)
-    up_srv.state = up_state
-    threading.Thread(target=up_srv.serve_forever, daemon=True).start()
-    up_port = up_srv.server_address[1]
+    up_runner = web.AppRunner(make_upstream_app(up_state))
+    await up_runner.setup()
+    up_site = web.TCPSite(up_runner, "127.0.0.1", 0)
+    await up_site.start()
+    up_port = up_site._server.sockets[0].getsockname()[1]
 
     cdir = os.path.join(tmp, "http_cache")
     wl_dir = os.path.join(tmp, "wl_http")
     mgr = proxy.CacheManager(cdir, max_cache_mb=0, flush_kb=64, ignore_params=set(), match_by_content=True)
-    psrv = proxy.ProxyHTTPServer(("127.0.0.1", 0), proxy.ProxyHandler, mgr, 32768)
-    threading.Thread(target=psrv.serve_forever, daemon=True).start()
-    pport = psrv.server_address[1]
+    psrv = proxy.AsyncRangeProxy(mgr, chunk_size=32768, connections=4, part_size_kb=256)
+    await psrv.start_session()
+    p_runner = web.AppRunner(psrv.build_app())
+    await p_runner.setup()
+    p_site = web.TCPSite(p_runner, "127.0.0.1", 0)
+    await p_site.start()
+    pport = p_site._server.sockets[0].getsockname()[1]
+    psrv.port = pport
 
     try:
         base = f"http://127.0.0.1:{pport}"
         url_a = f"http://127.0.0.1:{up_port}/a/Test.Movie.mkv"
         url_b = f"http://127.0.0.1:{up_port}/b/Mirror.mkv"
 
-        assert requests.get(f"{base}/__health", timeout=5).json()["status"] == "ok"
-        r_head = requests.head(f"{base}/stream", params={"url": url_a}, timeout=5)
-        assert r_head.status_code == 200 and int(r_head.headers["Content-Length"]) == len(payload)
+        async with aiohttp.ClientSession() as cli:
+            async with cli.get(f"{base}/__health") as r:
+                assert (await r.json())["status"] == "ok"
 
-        r1 = requests.get(f"{base}/stream", params={"url": url_a}, headers={"Range": "bytes=0-", "X-Mpv-Cache-Timeout": "30"}, timeout=5)
-        assert r1.status_code == 206 and r1.content == payload
-        _, _, hdrs = up_state["requests"][-1]
-        assert not any(k.lower().startswith("x-mpv-cache-") for k in hdrs)
+            async with cli.head(f"{base}/stream", params={"url": url_a}) as r:
+                assert r.status == 200 and int(r.headers["Content-Length"]) == len(payload)
 
-        up_state["block_paths"] = {"/a/Test.Movie.mkv"}
-        r_hit = requests.get(f"{base}/stream", params={"url": url_a}, headers={"Range": "bytes=1000-4999"}, timeout=5)
-        assert r_hit.status_code == 206 and r_hit.content == payload[1000:5000]
+            # Clear range_reqs after HEAD so we specifically inspect parallel GET slices
+            up_state["requests"].clear()
+            async with cli.get(
+                f"{base}/stream",
+                params={"url": url_a},
+                headers={"Range": "bytes=0-", "X-Mpv-Cache-Timeout": "30"},
+            ) as r1:
+                body1 = await r1.read()
+                assert r1.status == 206 and body1 == payload
 
-        assert requests.post(f"{base}/__watch_later", params={"url": url_a, "wl_dir": wl_dir, "pos": "42.5", "reason": "quit"}, timeout=5).json()["saved"]
-        r_b = requests.get(f"{base}/stream", params={"url": url_b}, headers={"Range": "bytes=0-"}, timeout=5)
-        assert r_b.status_code == 206 and r_b.content == payload
-        st_b = requests.get(f"{base}/__status", params={"url": url_b}, timeout=5).json()
-        assert st_b["entries_count"] == 1 and st_b["current"]["cached_bytes"] == len(payload)
+            get_reqs = [x for x in up_state["requests"] if x[0] == "GET" and x[1] == "/a/Test.Movie.mkv"]
+            assert len(get_reqs) >= 4, f"Expected parallel multi-part Range fetches, got {len(get_reqs)}"
+            assert all(not any(k.lower().startswith("x-mpv-cache-") for k in hdrs) for _, _, hdrs in get_reqs)
 
-        wl_b = requests.get(f"{base}/__watch_later", params={"url": url_b, "wl_dir": wl_dir}, timeout=5).json()
-        assert wl_b["resume"] is True and abs(wl_b["start"] - 42.5) < 0.01
+            # Offline cache hit (block upstream completely)
+            up_state["block_paths"] = {"/a/Test.Movie.mkv"}
+            async with cli.get(f"{base}/stream", params={"url": url_a}, headers={"Range": "bytes=1000-4999"}) as r_hit:
+                assert r_hit.status == 206 and (await r_hit.read()) == payload[1000:5000]
 
-        assert requests.get(f"{base}/stream", params={"url": f"http://127.0.0.1:{up_port}/fail404"}, timeout=5).status_code == 404
-        assert requests.get(f"{base}/stream", params={"url": url_a}, headers={"Range": f"bytes={len(payload) + 10}-"}, timeout=5).status_code == 416
+            # Watch-later save + cross-URL content dedup + resume
+            async with cli.post(f"{base}/__watch_later", params={"url": url_a, "wl_dir": wl_dir, "pos": "42.5", "reason": "quit"}) as rw:
+                assert (await rw.json())["saved"] is True
 
-        assert requests.post(f"{base}/__clear", params={"url": url_b}, timeout=5).json()["cleared"] is True
-        assert requests.post(f"{base}/__clear_all", timeout=5).json()["cleared_entries"] == 1
-        assert requests.get(f"{base}/__status", timeout=5).json()["entries_count"] == 0
-        print("[PASS] proxy HTTP, range, headers, dedup, watch_later, clear")
+            async with cli.get(f"{base}/stream", params={"url": url_b}, headers={"Range": "bytes=0-"}) as rb:
+                assert rb.status == 206 and (await rb.read()) == payload
+
+            async with cli.get(f"{base}/__status", params={"url": url_b}) as rs:
+                st_b = await rs.json()
+                assert st_b["entries_count"] == 1 and st_b["current"]["cached_bytes"] == len(payload)
+
+            async with cli.get(f"{base}/__watch_later", params={"url": url_b, "wl_dir": wl_dir}) as rwl:
+                wl_b = await rwl.json()
+                assert wl_b["resume"] is True and abs(wl_b["start"] - 42.5) < 0.01
+
+            async with cli.get(f"{base}/stream", params={"url": f"http://127.0.0.1:{up_port}/fail404"}) as r404:
+                assert r404.status == 404
+            async with cli.get(f"{base}/stream", params={"url": url_a}, headers={"Range": f"bytes={len(payload) + 10}-"}) as r416:
+                assert r416.status == 416
+
+            async with cli.post(f"{base}/__clear", params={"url": url_b}) as rc:
+                assert (await rc.json())["cleared"] is True
+            async with cli.post(f"{base}/__clear_all") as rca:
+                assert (await rca.json())["cleared_entries"] == 1
+            async with cli.get(f"{base}/__status") as rst:
+                assert (await rst.json())["entries_count"] == 0
+
+        print("[PASS] async aiohttp proxy: parallel multi-part Range, header strip, offline hit, dedup, watch_later, clear")
     finally:
-        psrv.shutdown()
-        psrv.server_close()
+        await psrv.close_session()
+        await p_runner.cleanup()
         mgr.flush_all()
-        up_srv.shutdown()
-        up_srv.server_close()
+        await up_runner.cleanup()
 
 
 def test_mpv_integration(tmp: str):
     if not (shutil.which("mpv") and shutil.which("ffmpeg")):
         print("[SKIP] mpv integration (mpv or ffmpeg not installed)")
         return
+
+    import json, http.server, socketserver, threading
+
+    class SyncRangeHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, fmt, *args): pass
+        def _serve(self, body_flag: bool):
+            st = self.server.state
+            path = urllib.parse.urlsplit(self.path).path
+            st["requests"].append((self.command, path))
+            if st.get("block_paths") and path in st["block_paths"]:
+                self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers(); return
+            data = st["files"].get(path)
+            if data is None:
+                self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+            total, rng = len(data), self.headers.get("Range")
+            if rng:
+                m = re.match(r"^bytes=(\d*)-(\d*)$", rng.strip())
+                if m and (m.group(1) or m.group(2)):
+                    s = int(m.group(1)) if m.group(1) else max(0, total - int(m.group(2)))
+                    e = min(int(m.group(2)) if m.group(2) else total - 1, total - 1)
+                    chunk = data[s : e + 1]
+                    st["bytes_sent"] += len(chunk)
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/x-matroska")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {s}-{e}/{total}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    if body_flag:
+                        self.wfile.write(chunk)
+                    return
+            st["bytes_sent"] += total
+            self.send_response(200)
+            self.send_header("Content-Type", "video/x-matroska")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(total))
+            self.end_headers()
+            if body_flag:
+                self.wfile.write(data)
+        def do_HEAD(self): self._serve(False)
+        def do_GET(self): self._serve(True)
+
+    class ThreadedHTTP(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
 
     mkv_path = os.path.join(tmp, "sample.mkv")
     subprocess.run(
@@ -211,10 +254,9 @@ def test_mpv_integration(tmp: str):
     )
     mkv_bytes = open(mkv_path, "rb").read()
 
-    up_state = {"files": {"/cdn1/Demo.Video.2026.mkv": mkv_bytes, "/cdn2/Other.Name.mkv": mkv_bytes}, "requests": [], "bytes_sent": 0, "support_range": True}
+    up_state = {"files": {"/cdn1/Demo.Video.2026.mkv": mkv_bytes, "/cdn2/Other.Name.mkv": mkv_bytes}, "requests": [], "bytes_sent": 0}
     up_host = "127.0.0.2" if os.name == "nt" else "127.0.0.1"
-    # Bind 127.0.0.2 on Windows so main.lua does not treat upstream as 127.0.0.1 loopback bypass
-    up_srv = ThreadedHTTP((up_host, 0), RangeRequestHandler)
+    up_srv = ThreadedHTTP((up_host, 0), SyncRangeHandler)
     up_srv.state = up_state
     threading.Thread(target=up_srv.serve_forever, daemon=True).start()
     up_port = up_srv.server_address[1]
@@ -231,7 +273,7 @@ def test_mpv_integration(tmp: str):
         "--cache=yes", "--demuxer-max-bytes=50MiB", "--save-position-on-quit=yes",
         f"--watch-later-directory={wl_dir}",
         f"--script={MAIN_LUA}",
-        f"--script-opts=http_range_cache-cache_dir={cdir},http_range_cache-idle_timeout=30,http_range_cache-show_osd=no,http_range_cache-match_by_content=yes",
+        f"--script-opts=http_range_cache-cache_dir={cdir},http_range_cache-idle_timeout=30,http_range_cache-show_osd=no,http_range_cache-match_by_content=yes,http_range_cache-connections=4,http_range_cache-part_size_kb=256",
     ]
 
     try:
@@ -284,7 +326,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="mpv_cache_test_")
     try:
         test_unit_helpers(tmp)
-        test_proxy_http_and_dedup(tmp)
+        asyncio.run(run_async_proxy_tests(tmp))
         if not args.skip_mpv:
             test_mpv_integration(tmp)
         print("ALL TESTS PASSED")
@@ -294,4 +336,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

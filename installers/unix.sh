@@ -98,11 +98,11 @@ fi
 
 py_cmd="$(command -v python3 || command -v python || true)"
 if [ -n "$py_cmd" ]; then
-	if ! "$py_cmd" -c "import requests" >/dev/null 2>&1; then
-		echo "Note: Python 'requests' module missing. Install with: $py_cmd -m pip install requests"
+	if ! "$py_cmd" -c "import aiohttp" >/dev/null 2>&1; then
+		echo "Note: Python 'aiohttp' module missing. Install with: $py_cmd -m pip install aiohttp"
 	fi
 else
-	echo "Note: Python 3 not found in PATH. Install Python 3 + 'pip install requests' to run proxy.py."
+	echo "Note: Python 3 not found in PATH. Install Python 3 + 'pip install aiohttp' to run proxy.py."
 fi
 
 echo "mpv-http-range-cache has been installed."

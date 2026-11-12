@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Local HTTP 206 Range-Caching Proxy for mpv."""
+"""Fully async aiohttp HTTP 206 Range-Caching Proxy for mpv with parallel downloads."""
 
 import argparse
+import asyncio
+from collections import deque
 import hashlib
-import http.server
 import json
 import os
 import re
@@ -15,10 +16,8 @@ import time
 import urllib.parse
 from typing import Dict, List, Optional, Tuple
 
-import requests
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import aiohttp
+from aiohttp import web
 
 if os.name == "nt":
     import ctypes
@@ -28,7 +27,7 @@ else:
 
 FSCTL_SET_SPARSE = 0x000900C4
 HEAD_HASH_BYTES = 65536
-DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError)
+DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError, aiohttp.ClientConnectionError)
 
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -91,7 +90,7 @@ def _atomic_write_json(path: str, payload: dict, make_dir: bool = False) -> bool
 
 
 def set_sparse_file(file_obj) -> None:
-    """Mark a newly created NTFS file sparse so skipped seeks don't zero-fill."""
+    """Mark a newly created NTFS file sparse so skipped seeks do not zero-fill."""
     if os.name != "nt":
         return
     try:
@@ -551,7 +550,7 @@ class CacheManager:
             if key and url:
                 self._register_loaded_entry(key, url, subdir)
 
-        # One-time migration for any legacy flat cache files
+        # One-time migration for legacy flat cache files
         for name in names:
             if not name.endswith(".meta.json"):
                 continue
@@ -725,7 +724,6 @@ class CacheManager:
 
         best_mtime, best_text, is_current = max(candidates, key=lambda c: c[0])
         cur_mtime = next((c[0] for c in candidates if c[2]), None)
-        # Prefer current file within 1s of newest so native mpv resume isn't overridden
         if is_current or (cur_mtime is not None and best_mtime - cur_mtime <= 1.0):
             return {"resume": False, "already_had": True}
 
@@ -793,91 +791,72 @@ class CacheManager:
             }
 
 
-class ProxyHTTPServer(http.server.ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    request_queue_size = 64
+class AsyncRangeProxy:
+    """Async aiohttp web server and upstream multi-connection range downloader."""
 
-    def __init__(self, server_address, handler_class, manager: CacheManager, chunk_size: int):
+    def __init__(self, manager: CacheManager, chunk_size: int = 65536, connections: int = 4, part_size_kb: int = 2048):
         self.manager = manager
-        self.chunk_size = chunk_size
-        self.activity_lock = threading.Lock()
+        self.chunk_size = max(8192, chunk_size)
+        self.connections = max(1, min(16, connections))
+        self.part_size = max(262144, part_size_kb * 1024)
         self.active_requests = 0
         self.last_activity = time.monotonic()
-        self.thread_local = threading.local()
-        super().__init__(server_address, handler_class)
+        self.port = 0
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    def get_session(self) -> requests.Session:
-        sess = getattr(self.thread_local, "session", None)
-        if sess is None:
-            sess = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
-            sess.mount("http://", adapter)
-            sess.mount("https://", adapter)
-            self.thread_local.session = sess
-        sess.cookies.clear()
-        return sess
+    async def start_session(self) -> None:
+        if self.session is not None and not self.session.closed:
+            return
+        connector = aiohttp.TCPConnector(
+            limit=max(64, self.connections * 8),
+            limit_per_host=max(32, self.connections * 4),
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            keepalive_timeout=60.0,
+        )
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            auto_decompress=False,
+            cookie_jar=aiohttp.DummyCookieJar(),
+            read_bufsize=262144,
+        )
 
-    def begin_request(self) -> None:
-        with self.activity_lock:
-            self.active_requests += 1
-            self.last_activity = time.monotonic()
+    async def close_session(self) -> None:
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+        self.session = None
 
-    def end_request(self) -> None:
-        with self.activity_lock:
+    @web.middleware
+    async def _activity_middleware(self, request: web.Request, handler):
+        self.active_requests += 1
+        self.last_activity = time.monotonic()
+        try:
+            return await handler(request)
+        finally:
             self.active_requests = max(0, self.active_requests - 1)
             self.last_activity = time.monotonic()
 
+    def build_app(self) -> web.Application:
+        app = web.Application(middlewares=[self._activity_middleware])
+        app.router.add_get("/__health", self.handle_health)
+        app.router.add_get("/__status", self.handle_status)
+        app.router.add_get("/__watch_later", self.handle_get_watch_later)
+        app.router.add_post("/__watch_later", self.handle_post_watch_later)
+        app.router.add_post("/__clear", self.handle_clear)
+        app.router.add_post("/__clear_all", self.handle_clear_all)
+        app.router.add_get("/stream", self.handle_stream_get, allow_head=False)
+        app.router.add_head("/stream", self.handle_stream_head)
+        return app
 
-class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, format, *args):
-        pass
-
-    def _parse_req(self) -> Tuple[str, dict]:
-        parsed = urllib.parse.urlsplit(self.path)
-        return parsed.path, urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-
-    def _send_json(self, status: int, payload: dict) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_media_headers(
-        self,
-        status: int,
-        content_type: str,
-        content_length: Optional[int],
-        accept_ranges: bool,
-        content_range: Optional[str] = None,
-    ) -> None:
-        self.send_response(status)
-        if content_range:
-            self.send_header("Content-Range", content_range)
-        self.send_header("Content-Type", content_type)
-        if accept_ranges:
-            self.send_header("Accept-Ranges", "bytes")
-        if content_length is not None:
-            self.send_header("Content-Length", str(content_length))
-        else:
-            self.send_header("Connection", "close")
-            self.close_connection = True
-        self.end_headers()
-
-    def _extract_upstream_config(self) -> Tuple[Optional[str], dict, Optional[dict], bool, float]:
-        _, qs = self._parse_req()
-        target_url = qs.get("url", [None])[0]
-        upstream_headers = {}
-        proxy_url = None
+    @staticmethod
+    def _extract_upstream_config(request: web.Request) -> Tuple[Optional[str], dict, Optional[str], bool, float]:
+        target_url = request.query.get("url")
+        upstream_headers: dict = {}
+        proxy_url: Optional[str] = None
         tls_verify = True
         timeout_sec = 60.0
 
-        for k, v in self.headers.items():
+        for k, v in request.headers.items():
             kl = k.lower()
             if kl == "x-mpv-cache-proxy":
                 proxy_url = v.strip() or None
@@ -892,40 +871,51 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 upstream_headers[k] = v
 
         upstream_headers["Accept-Encoding"] = "identity"
-        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        return target_url, upstream_headers, proxies, tls_verify, timeout_sec
+        return target_url, upstream_headers, proxy_url, tls_verify, timeout_sec
 
-    def _fetch_upstream(
+    async def _fetch_upstream(
         self,
         method: str,
         url: str,
         headers: dict,
-        proxies: Optional[dict],
+        proxy_url: Optional[str],
         tls_verify: bool,
         timeout_sec: float,
         range_header: Optional[str] = None,
-    ) -> requests.Response:
+    ) -> aiohttp.ClientResponse:
+        await self.start_session()
         req_headers = dict(headers)
         if range_header is not None:
             req_headers["Range"] = range_header
-        return self.server.get_session().request(
-            method=method, url=url, headers=req_headers, proxies=proxies,
-            verify=tls_verify, stream=True, allow_redirects=True,
-            timeout=(min(20.0, timeout_sec), timeout_sec),
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=min(20.0, timeout_sec),
+            sock_connect=min(20.0, timeout_sec),
+            sock_read=timeout_sec,
+        )
+        return await self.session.request(
+            method=method,
+            url=url,
+            headers=req_headers,
+            proxy=proxy_url,
+            ssl=None if tls_verify else False,
+            allow_redirects=True,
+            timeout=timeout,
         )
 
-    def _record_probe_meta(self, entry: CacheEntry, resp: requests.Response) -> None:
+    @staticmethod
+    def _record_probe_meta(entry: CacheEntry, resp: aiohttp.ClientResponse) -> None:
         ct = resp.headers.get("Content-Type", "application/octet-stream")
         if is_non_cacheable_ct(ct):
             return
         accept_ranges = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
         total_size = None
-        if resp.status_code == 206:
+        if resp.status == 206:
             accept_ranges = True
             cr = parse_content_range(resp.headers.get("Content-Range", ""))
             if cr:
                 total_size = cr[2]
-        elif resp.status_code == 200:
+        elif resp.status == 200:
             cl = resp.headers.get("Content-Length")
             if cl and cl.isdigit():
                 total_size = int(cl)
@@ -938,114 +928,119 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             entry.update_metadata(**meta_kw)
         entry.save_meta(force=True)
 
-    def do_HEAD(self):
-        self.server.begin_request()
-        try:
-            path, _ = self._parse_req()
-            if path == "/__health":
-                return self._send_media_headers(200, "application/json", 0, False)
-            if path != "/stream":
-                return self.send_error(404)
+    @staticmethod
+    def _media_headers(
+        content_type: str,
+        content_length: Optional[int],
+        accept_ranges: bool,
+        content_range: Optional[str] = None,
+    ) -> dict:
+        hdrs = {"Content-Type": content_type}
+        if content_range:
+            hdrs["Content-Range"] = content_range
+        if accept_ranges:
+            hdrs["Accept-Ranges"] = "bytes"
+        if content_length is not None:
+            hdrs["Content-Length"] = str(content_length)
+        return hdrs
 
-            target_url, upstream_headers, proxies, tls_verify, timeout_sec = self._extract_upstream_config()
-            if not target_url:
-                return self.send_error(400, "Missing url")
+    async def handle_health(self, request: web.Request) -> web.Response:
+        if request.method == "HEAD":
+            return web.Response(status=200, headers={"Content-Type": "application/json", "Content-Length": "0"})
+        return web.json_response({"status": "ok", "pid": os.getpid(), "port": self.port})
 
-            entry = self.server.manager.get_entry(target_url)
-            with entry.lock:
-                if entry.total_size is not None:
-                    return self._send_media_headers(200, entry.content_type, entry.total_size, entry.accept_ranges)
+    async def handle_status(self, request: web.Request) -> web.Response:
+        return web.json_response(self.manager.stats(request.query.get("url")))
 
-            resp = self._fetch_upstream("HEAD", target_url, upstream_headers, proxies, tls_verify, timeout_sec)
+    async def handle_get_watch_later(self, request: web.Request) -> web.Response:
+        target_url = request.query.get("url")
+        if not target_url:
+            return web.json_response({"error": "Missing url"}, status=400)
+        return web.json_response(self.manager.get_watch_later(target_url, request.query.get("wl_dir")))
+
+    async def handle_post_watch_later(self, request: web.Request) -> web.Response:
+        target_url = request.query.get("url")
+        if not target_url:
+            return web.json_response({"error": "Missing url"}, status=400)
+        pos_val = None
+        pos_str = request.query.get("pos")
+        if pos_str is not None:
             try:
-                if resp.status_code == 405:
+                pos_val = float(pos_str)
+            except ValueError:
+                pass
+        res = self.manager.sync_watch_later(
+            target_url, request.query.get("wl_dir"), pos_val, request.query.get("reason", "")
+        )
+        return web.json_response(res)
+
+    async def handle_clear(self, request: web.Request) -> web.Response:
+        target_url = request.query.get("url")
+        if not target_url:
+            return web.json_response({"error": "Missing url"}, status=400)
+        return web.json_response({"cleared": self.manager.clear_url(target_url)})
+
+    async def handle_clear_all(self, request: web.Request) -> web.Response:
+        return web.json_response({"cleared_entries": self.manager.clear_all()})
+
+    async def handle_stream_head(self, request: web.Request) -> web.Response:
+        target_url, upstream_headers, proxy_url, tls_verify, timeout_sec = self._extract_upstream_config(request)
+        if not target_url:
+            return web.Response(status=400, text="Missing url")
+        entry = self.manager.get_entry(target_url)
+        with entry.lock:
+            if entry.total_size is not None:
+                return web.Response(
+                    status=200,
+                    headers=self._media_headers(entry.content_type, entry.total_size, entry.accept_ranges),
+                )
+        try:
+            resp = await self._fetch_upstream("HEAD", target_url, upstream_headers, proxy_url, tls_verify, timeout_sec)
+            try:
+                if resp.status == 405:
                     resp.close()
-                    resp = self._fetch_upstream(
-                        "GET", target_url, upstream_headers, proxies, tls_verify, timeout_sec, range_header="bytes=0-0"
+                    resp = await self._fetch_upstream(
+                        "GET", target_url, upstream_headers, proxy_url, tls_verify, timeout_sec, range_header="bytes=0-0"
                     )
                 self._record_probe_meta(entry, resp)
-                self._send_media_headers(
-                    200 if resp.status_code in (200, 206) else resp.status_code,
-                    resp.headers.get("Content-Type", "application/octet-stream"),
-                    entry.total_size,
-                    entry.accept_ranges,
+                status = 200 if resp.status in (200, 206) else resp.status
+                return web.Response(
+                    status=status,
+                    headers=self._media_headers(
+                        resp.headers.get("Content-Type", "application/octet-stream"),
+                        entry.total_size,
+                        entry.accept_ranges,
+                    ),
                 )
             finally:
                 resp.close()
         except Exception as e:
-            try:
-                self.close_connection = True
-                self.send_error(502, str(e))
-            except Exception:
-                pass
-        finally:
-            self.server.end_request()
+            return web.Response(status=502, text=str(e))
 
-    def do_POST(self):
-        self.server.begin_request()
-        try:
-            path, qs = self._parse_req()
-            content_len = int(self.headers.get("Content-Length", "0") or "0")
-            if content_len > 0:
-                self.rfile.read(content_len)
-            target_url = qs.get("url", [None])[0]
-            if path == "/__clear_all":
-                return self._send_json(200, {"cleared_entries": self.server.manager.clear_all()})
-            if path in ("/__clear", "/__watch_later") and not target_url:
-                return self._send_json(400, {"error": "Missing url"})
-            if path == "/__clear":
-                return self._send_json(200, {"cleared": self.server.manager.clear_url(target_url)})
-            if path == "/__watch_later":
-                pos_val = None
-                try:
-                    if qs.get("pos", [None])[0] is not None:
-                        pos_val = float(qs["pos"][0])
-                except ValueError:
-                    pass
-                return self._send_json(200, self.server.manager.sync_watch_later(
-                    target_url, qs.get("wl_dir", [None])[0], pos_val, qs.get("reason", [""])[0]
-                ))
-            self._send_json(404, {"error": "Not found"})
-        finally:
-            self.server.end_request()
-
-    def do_GET(self):
-        self.server.begin_request()
-        try:
-            path, qs = self._parse_req()
-            target_url = qs.get("url", [None])[0]
-            if path == "/__health":
-                self._send_json(200, {"status": "ok", "pid": os.getpid(), "port": self.server.server_address[1]})
-            elif path == "/__status":
-                self._send_json(200, self.server.manager.stats(target_url))
-            elif path == "/__watch_later":
-                if not target_url:
-                    self._send_json(400, {"error": "Missing url"})
-                else:
-                    self._send_json(200, self.server.manager.get_watch_later(target_url, qs.get("wl_dir", [None])[0]))
-            elif path == "/stream":
-                self._handle_stream()
-            else:
-                self._send_json(404, {"error": "Not found"})
-        finally:
-            self.server.end_request()
-
-    def _handle_stream(self) -> None:
-        target_url, upstream_headers, proxies, tls_verify, timeout_sec = self._extract_upstream_config()
+    async def handle_stream_get(self, request: web.Request) -> web.StreamResponse:
+        target_url, upstream_headers, proxy_url, tls_verify, timeout_sec = self._extract_upstream_config(request)
         if not target_url:
-            return self.send_error(400, "Missing url parameter")
-        entry = self.server.manager.get_entry(target_url)
+            return web.Response(status=400, text="Missing url parameter")
+        entry = self.manager.get_entry(target_url)
         entry.acquire_user()
         try:
-            self._handle_stream_for_entry(entry, target_url, upstream_headers, proxies, tls_verify, timeout_sec)
+            return await self._handle_stream_for_entry(
+                request, entry, target_url, upstream_headers, proxy_url, tls_verify, timeout_sec
+            )
         finally:
             entry.release_user()
 
-    def _handle_stream_for_entry(
-        self, entry: CacheEntry, target_url: str, upstream_headers: dict,
-        proxies: Optional[dict], tls_verify: bool, timeout_sec: float,
-    ) -> None:
-        client_range_hdr = self.headers.get("Range")
+    async def _handle_stream_for_entry(
+        self,
+        request: web.Request,
+        entry: CacheEntry,
+        target_url: str,
+        upstream_headers: dict,
+        proxy_url: Optional[str],
+        tls_verify: bool,
+        timeout_sec: float,
+    ) -> web.StreamResponse:
+        client_range_hdr = request.headers.get("Range")
         with entry.lock:
             known_total = entry.total_size
             known_ct = entry.content_type
@@ -1057,43 +1052,53 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 has_range, req_start, req_end = parse_range_header(client_range_hdr, known_total)
             except ValueError:
-                return self._send_media_headers(416, known_ct, 0, False, content_range=f"bytes */{known_total}")
+                return web.Response(status=416, headers={"Content-Range": f"bytes */{known_total}"})
             if req_start is not None and req_end is not None:
-                self._serve_known_range(
-                    entry, has_range, req_start, req_end, known_total, known_ct,
-                    upstream_headers, proxies, tls_verify, timeout_sec,
+                resp = await self._serve_known_range(
+                    request, entry, has_range, req_start, req_end, known_total, known_ct,
+                    upstream_headers, proxy_url, tls_verify, timeout_sec,
                 )
-                self.server.manager.maybe_evict(protect_key=entry.key)
-                return
+                self.manager.maybe_evict(protect_key=entry.key)
+                return resp
 
         try:
-            has_range, _, _ = parse_range_header(client_range_hdr, None)
+            has_range, req_start, req_end = parse_range_header(client_range_hdr, None)
         except ValueError:
-            return self._send_media_headers(416, "application/octet-stream", 0, False)
+            return web.Response(status=416)
+
+        # On cold open-ended starts with parallel mode enabled, probe only the first part
+        # so multi-connection workers can accelerate everything after part 0 immediately.
+        probe_capped = (
+            self.connections > 1
+            and (req_start in (None, 0))
+            and req_end is None
+        )
+        probe_range = f"bytes=0-{self.part_size - 1}" if probe_capped else (client_range_hdr or "bytes=0-")
 
         try:
-            resp = self._fetch_upstream(
-                "GET", target_url, upstream_headers, proxies, tls_verify, timeout_sec,
-                range_header=client_range_hdr or "bytes=0-",
+            up_resp = await self._fetch_upstream(
+                "GET", target_url, upstream_headers, proxy_url, tls_verify, timeout_sec, range_header=probe_range
             )
         except Exception as e:
-            self.close_connection = True
-            return self.send_error(502, f"Upstream error: {e}")
+            return web.Response(status=502, text=f"Upstream error: {e}")
 
+        close_up_in_finally = True
         try:
-            ct = resp.headers.get("Content-Type", "application/octet-stream")
-            if resp.status_code not in (200, 206) or is_non_cacheable_ct(ct):
-                return self._passthrough_response(resp, send_as_200=(not has_range and resp.status_code == 206))
+            ct = up_resp.headers.get("Content-Type", "application/octet-stream")
+            if up_resp.status not in (200, 206) or is_non_cacheable_ct(ct):
+                return await self._passthrough_response(
+                    request, up_resp, send_as_200=(not has_range and up_resp.status == 206)
+                )
 
-            if resp.status_code == 206:
-                cr = parse_content_range(resp.headers.get("Content-Range", ""))
+            if up_resp.status == 206:
+                cr = parse_content_range(up_resp.headers.get("Content-Range", ""))
                 if not cr:
-                    self._record_probe_meta(entry, resp)
-                    return self._passthrough_response(resp, send_as_200=(not has_range))
+                    self._record_probe_meta(entry, up_resp)
+                    return await self._passthrough_response(request, up_resp, send_as_200=(not has_range))
                 u_start, u_end, u_total = cr
                 stream_max_bytes: Optional[int] = u_end - u_start + 1
             else:
-                cl = resp.headers.get("Content-Length")
+                cl = up_resp.headers.get("Content-Length")
                 u_start = 0
                 u_total = int(cl) if (cl and cl.isdigit()) else None
                 u_end = (u_total - 1) if u_total is not None else None
@@ -1103,12 +1108,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             head_buf, head_hash = b"", None
             if (
                 u_start == 0 and u_total and not entry.ranges
-                and self.server.manager.has_candidates_for_size(u_total, exclude_key=entry.key)
+                and self.manager.has_candidates_for_size(u_total, exclude_key=entry.key)
             ):
                 need_len = min(HEAD_HASH_BYTES, u_total)
                 chunks, got = [], 0
                 while got < need_len:
-                    part = resp.raw.read(need_len - got, decode_content=False)
+                    part = await up_resp.content.read(need_len - got)
                     if not part:
                         break
                     chunks.append(part)
@@ -1116,13 +1121,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 head_buf = b"".join(chunks)
                 if len(head_buf) == need_len:
                     head_hash = hashlib.sha256(head_buf).hexdigest()
-                    matched = self.server.manager.find_matching_entry(u_total, head_hash, exclude_key=entry.key)
+                    matched = self.manager.find_matching_entry(u_total, head_hash, exclude_key=entry.key)
                     if matched is not None:
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
-                        self.server.manager.link_alias(entry.key, matched.key, target_url)
+                        up_resp.close()
+                        close_up_in_finally = False
+                        self.manager.link_alias(entry.key, matched.key, target_url)
                         matched.acquire_user()
                         try:
                             m_has_range, m_start, m_end = parse_range_header(client_range_hdr, u_total)
@@ -1130,120 +1133,173 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                 m_start, m_end = 0, u_total - 1
                             with matched.lock:
                                 m_ct = matched.content_type or ct
-                            self._serve_known_range(
-                                matched, m_has_range, m_start, m_end, u_total, m_ct,
-                                upstream_headers, proxies, tls_verify, timeout_sec,
+                            resp = await self._serve_known_range(
+                                request, matched, m_has_range, m_start, m_end, u_total, m_ct,
+                                upstream_headers, proxy_url, tls_verify, timeout_sec,
                             )
                         finally:
                             matched.release_user()
-                        self.server.manager.maybe_evict(protect_key=matched.key)
-                        return
+                        self.manager.maybe_evict(protect_key=matched.key)
+                        return resp
 
-            self._record_probe_meta(entry, resp)
+            self._record_probe_meta(entry, up_resp)
             if head_hash:
                 with entry.lock:
                     entry.head_hash = head_hash
                     entry._dirty_meta = True
 
-            if resp.status_code == 206:
+            # Hand off cold capped probe into full parallel _serve_known_range seamlessly
+            if probe_capped and up_resp.status == 206 and u_start == 0 and u_total and u_end < u_total - 1:
+                if head_buf:
+                    entry.write_chunk(0, head_buf)
+                    u_start = len(head_buf)
+                    stream_max_bytes = max(0, (u_end - u_start + 1))
+                close_up_in_finally = False
+                resp = await self._serve_known_range(
+                    request, entry, has_range, 0, u_total - 1, u_total, ct,
+                    upstream_headers, proxy_url, tls_verify, timeout_sec,
+                    cold_part0=(up_resp, head_buf, u_start, u_end, stream_max_bytes),
+                )
+                self.manager.maybe_evict(protect_key=entry.key)
+                return resp
+
+            if up_resp.status == 206:
                 cr_hdr = f"bytes {u_start}-{u_end}/{u_total if u_total is not None else '*'}" if has_range else None
-                self._send_media_headers(206 if has_range else 200, ct, u_end - u_start + 1, True, cr_hdr)
+                hdrs = self._media_headers(ct, u_end - u_start + 1, True, cr_hdr)
+                status = 206 if has_range else 200
             else:
-                self._send_media_headers(200, ct, u_total, entry.accept_ranges)
+                hdrs = self._media_headers(ct, u_total, entry.accept_ranges)
+                status = 200
 
-            if head_buf:
-                entry.write_chunk(u_start, head_buf)
-                try:
-                    self.wfile.write(head_buf)
-                except DISCONNECT_ERRORS:
-                    self.close_connection = True
-                    return
-                if stream_max_bytes is not None:
-                    stream_max_bytes = max(0, stream_max_bytes - len(head_buf))
-                u_start += len(head_buf)
+            client_resp = web.StreamResponse(status=status, headers=hdrs)
+            if hdrs.get("Content-Length") is None:
+                client_resp.force_close()
+            await client_resp.prepare(request)
 
-            self._stream_and_cache_upstream(resp, entry, start_offset=u_start, max_bytes=stream_max_bytes)
-        finally:
             try:
-                resp.close()
-            except Exception:
+                if head_buf:
+                    entry.write_chunk(u_start, head_buf)
+                    await client_resp.write(head_buf)
+                    if stream_max_bytes is not None:
+                        stream_max_bytes = max(0, stream_max_bytes - len(head_buf))
+                    u_start += len(head_buf)
+                await self._stream_and_cache_upstream(
+                    client_resp, up_resp, entry, start_offset=u_start, max_bytes=stream_max_bytes
+                )
+                await client_resp.write_eof()
+            except DISCONNECT_ERRORS + (asyncio.CancelledError,):
                 pass
+            return client_resp
+        finally:
+            if close_up_in_finally:
+                up_resp.close()
             entry.save_meta(force=True)
-            self.server.manager.maybe_evict(protect_key=entry.key)
+            self.manager.maybe_evict(protect_key=entry.key)
 
-    def _passthrough_response(self, resp: requests.Response, send_as_200: bool = False) -> None:
-        self.send_response(200 if send_as_200 else resp.status_code)
-        for k, v in resp.headers.items():
+    async def _passthrough_response(
+        self, request: web.Request, up_resp: aiohttp.ClientResponse, send_as_200: bool = False
+    ) -> web.StreamResponse:
+        status = 200 if send_as_200 else up_resp.status
+        hdrs = {}
+        for k, v in up_resp.headers.items():
             kl = k.lower()
             if kl in ("transfer-encoding", "connection", "keep-alive", "content-encoding"):
                 continue
             if send_as_200 and kl == "content-range":
                 continue
-            self.send_header(k, v)
-        if "content-length" not in {k.lower() for k in resp.headers}:
-            self.send_header("Connection", "close")
-            self.close_connection = True
-        self.end_headers()
-        try:
-            while (chunk := resp.raw.read(self.server.chunk_size, decode_content=False)):
-                self.wfile.write(chunk)
-        except DISCONNECT_ERRORS:
-            self.close_connection = True
+            hdrs[k] = v
 
-    def _stream_and_cache_upstream(
-        self, resp: requests.Response, entry: CacheEntry, start_offset: int,
-        max_bytes: Optional[int], skip_leading: int = 0,
+        client_resp = web.StreamResponse(status=status, headers=hdrs)
+        if "content-length" not in {k.lower() for k in hdrs}:
+            client_resp.force_close()
+        await client_resp.prepare(request)
+        try:
+            async for chunk in up_resp.content.iter_any():
+                await client_resp.write(chunk)
+            await client_resp.write_eof()
+        except DISCONNECT_ERRORS + (asyncio.CancelledError,):
+            pass
+        return client_resp
+
+    async def _stream_and_cache_upstream(
+        self,
+        client_resp: web.StreamResponse,
+        up_resp: aiohttp.ClientResponse,
+        entry: CacheEntry,
+        start_offset: int,
+        max_bytes: Optional[int],
+        skip_leading: int = 0,
     ) -> int:
         offset, forwarded, remaining, to_skip = start_offset, 0, max_bytes, skip_leading
         try:
-            while remaining is None or remaining > 0:
-                to_read = self.server.chunk_size if remaining is None else min(self.server.chunk_size, remaining)
-                chunk = resp.raw.read(to_read, decode_content=False)
-                if not chunk:
-                    break
+            async for chunk in up_resp.content.iter_any():
+                if remaining is not None:
+                    if remaining <= 0:
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                    remaining -= len(chunk)
                 entry.write_chunk(offset, chunk)
                 offset += len(chunk)
-                if remaining is not None:
-                    remaining -= len(chunk)
                 if to_skip >= len(chunk):
                     to_skip -= len(chunk)
                     continue
                 out = chunk[to_skip:] if to_skip > 0 else chunk
                 to_skip = 0
-                self.wfile.write(out)
+                await client_resp.write(out)
                 forwarded += len(out)
-            self.wfile.flush()
-        except DISCONNECT_ERRORS:
-            self.close_connection = True
+                if remaining is not None and remaining <= 0:
+                    break
+        except DISCONNECT_ERRORS + (asyncio.CancelledError,):
+            pass
         return forwarded
 
-    def _serve_known_range(
-        self, entry: CacheEntry, has_range: bool, req_start: int, req_end: int, total_size: int,
-        content_type: str, upstream_headers: dict, proxies: Optional[dict], tls_verify: bool, timeout_sec: float,
-    ) -> None:
-        segments = entry.snapshot_plan(req_start, req_end)
+    async def _serve_known_range(
+        self,
+        request: web.Request,
+        entry: CacheEntry,
+        has_range: bool,
+        req_start: int,
+        req_end: int,
+        total_size: int,
+        content_type: str,
+        upstream_headers: dict,
+        proxy_url: Optional[str],
+        tls_verify: bool,
+        timeout_sec: float,
+        cold_part0: Optional[Tuple[aiohttp.ClientResponse, bytes, int, int, int]] = None,
+    ) -> web.StreamResponse:
+        if cold_part0 is not None:
+            up0, head_buf, u0_start, u0_end, _ = cold_part0
+            segments = [("net", 0, req_end)]
+        else:
+            up0, head_buf, u0_start, u0_end = None, b"", 0, 0
+            segments = entry.snapshot_plan(req_start, req_end)
 
         # Prefetch first network segment before committing headers so upstream 4xx/5xx propagate
-        prefetched_resp: Optional[requests.Response] = None
-        if segments and segments[0][0] == "net":
+        prefetched_resp: Optional[aiohttp.ClientResponse] = up0
+        if prefetched_resp is None and segments and segments[0][0] == "net":
             _, seg_s, seg_e = segments[0]
-            rng = f"bytes={seg_s}-" if seg_e == total_size - 1 else f"bytes={seg_s}-{seg_e}"
+            first_end = min(seg_e, seg_s + self.part_size - 1) if (
+                self.connections > 1 and entry.accept_ranges and (seg_e - seg_s + 1) > self.part_size
+            ) else seg_e
+            rng = f"bytes={seg_s}-" if first_end == total_size - 1 else f"bytes={seg_s}-{first_end}"
             try:
-                prefetched_resp = self._fetch_upstream(
-                    "GET", entry.url, upstream_headers, proxies, tls_verify, timeout_sec, range_header=rng
+                prefetched_resp = await self._fetch_upstream(
+                    "GET", entry.url, upstream_headers, proxy_url, tls_verify, timeout_sec, range_header=rng
                 )
             except Exception as e:
-                self.close_connection = True
-                return self.send_error(502, f"Upstream error: {e}")
-            if prefetched_resp.status_code not in (200, 206):
+                return web.Response(status=502, text=f"Upstream error: {e}")
+            if prefetched_resp.status not in (200, 206):
                 try:
-                    return self._passthrough_response(prefetched_resp)
+                    return await self._passthrough_response(prefetched_resp)
                 finally:
                     prefetched_resp.close()
 
         cr_hdr = f"bytes {req_start}-{req_end}/{total_size}" if has_range else None
-        self._send_media_headers(206 if has_range else 200, content_type, req_end - req_start + 1, True, cr_hdr)
-        chunk_size = self.server.chunk_size
+        hdrs = self._media_headers(content_type, req_end - req_start + 1, True, cr_hdr)
+        client_resp = web.StreamResponse(status=206 if has_range else 200, headers=hdrs)
+        await client_resp.prepare(request)
         entry.touch()
 
         try:
@@ -1251,52 +1307,77 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if kind == "cache":
                     pos = seg_s
                     while pos <= seg_e:
-                        data = entry.read_chunk(pos, min(chunk_size, seg_e - pos + 1))
+                        data = entry.read_chunk(pos, min(self.chunk_size, seg_e - pos + 1))
                         if not data:
-                            self._fetch_and_stream_net_segment(
-                                entry, pos, seg_e, total_size, upstream_headers, proxies, tls_verify, timeout_sec
+                            await self._fetch_net_segment(
+                                client_resp, entry, pos, seg_e, total_size,
+                                upstream_headers, proxy_url, tls_verify, timeout_sec,
                             )
                             break
-                        self.wfile.write(data)
+                        await client_resp.write(data)
                         pos += len(data)
+                        await asyncio.sleep(0)
                 else:
-                    resp = prefetched_resp if idx == 0 else None
+                    resp0 = prefetched_resp if idx == 0 else None
+                    c_info = (head_buf, u0_start, u0_end) if (idx == 0 and cold_part0 is not None) else None
                     if idx == 0:
                         prefetched_resp = None
-                    if not self._fetch_and_stream_net_segment(
-                        entry, seg_s, seg_e, total_size, upstream_headers, proxies, tls_verify, timeout_sec, resp
-                    ):
-                        self.close_connection = True
+                    ok = await self._fetch_net_segment(
+                        client_resp, entry, seg_s, seg_e, total_size,
+                        upstream_headers, proxy_url, tls_verify, timeout_sec,
+                        existing_resp=resp0, cold_part0_info=c_info,
+                    )
+                    if not ok:
                         break
-            self.wfile.flush()
-        except DISCONNECT_ERRORS:
-            self.close_connection = True
+            await client_resp.write_eof()
+        except DISCONNECT_ERRORS + (asyncio.CancelledError,):
+            pass
         finally:
             if prefetched_resp is not None:
-                try:
-                    prefetched_resp.close()
-                except Exception:
-                    pass
+                prefetched_resp.close()
             entry.save_meta(force=True)
+        return client_resp
 
-    def _fetch_and_stream_net_segment(
-        self, entry: CacheEntry, seg_s: int, seg_e: int, total_size: int,
-        upstream_headers: dict, proxies: Optional[dict], tls_verify: bool,
-        timeout_sec: float, existing_resp: Optional[requests.Response] = None,
+    async def _fetch_net_segment(
+        self,
+        client_resp: web.StreamResponse,
+        entry: CacheEntry,
+        seg_s: int,
+        seg_e: int,
+        total_size: int,
+        upstream_headers: dict,
+        proxy_url: Optional[str],
+        tls_verify: bool,
+        timeout_sec: float,
+        existing_resp: Optional[aiohttp.ClientResponse] = None,
+        cold_part0_info: Optional[Tuple[bytes, int, int]] = None,
     ) -> bool:
+        total_needed = seg_e - seg_s + 1
+        use_parallel = (
+            self.connections > 1
+            and entry.accept_ranges
+            and (cold_part0_info is not None or total_needed > self.part_size)
+            and (existing_resp is None or existing_resp.status == 206)
+        )
+        if use_parallel:
+            return await self._fetch_parallel_net_segment(
+                client_resp, entry, seg_s, seg_e, total_size,
+                upstream_headers, proxy_url, tls_verify, timeout_sec,
+                existing_resp=existing_resp, cold_part0_info=cold_part0_info,
+            )
+
         resp = existing_resp
         if resp is None:
             rng = f"bytes={seg_s}-" if seg_e == total_size - 1 else f"bytes={seg_s}-{seg_e}"
             try:
-                resp = self._fetch_upstream(
-                    "GET", entry.url, upstream_headers, proxies, tls_verify, timeout_sec, range_header=rng
+                resp = await self._fetch_upstream(
+                    "GET", entry.url, upstream_headers, proxy_url, tls_verify, timeout_sec, range_header=rng
                 )
             except Exception:
                 return False
 
         try:
-            needed = seg_e - seg_s + 1
-            if resp.status_code == 206:
+            if resp.status == 206:
                 cr = parse_content_range(resp.headers.get("Content-Range", ""))
                 if cr:
                     u_start, u_end, u_total = cr
@@ -1306,25 +1387,204 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if u_start > seg_s:
                         return False
                     skip = seg_s - u_start
-                    got = self._stream_and_cache_upstream(
-                        resp, entry, start_offset=u_start,
-                        max_bytes=min(u_end - u_start + 1, skip + needed), skip_leading=skip,
+                    got = await self._stream_and_cache_upstream(
+                        client_resp, resp, entry, start_offset=u_start,
+                        max_bytes=min(u_end - u_start + 1, skip + total_needed), skip_leading=skip,
                     )
                 else:
-                    got = self._stream_and_cache_upstream(resp, entry, start_offset=seg_s, max_bytes=needed)
-                return got == needed
+                    got = await self._stream_and_cache_upstream(
+                        client_resp, resp, entry, start_offset=seg_s, max_bytes=total_needed
+                    )
+                return got == total_needed
 
-            if resp.status_code == 200:
-                got = self._stream_and_cache_upstream(
-                    resp, entry, start_offset=0, max_bytes=seg_e + 1, skip_leading=seg_s
+            if resp.status == 200:
+                got = await self._stream_and_cache_upstream(
+                    client_resp, resp, entry, start_offset=0, max_bytes=seg_e + 1, skip_leading=seg_s
                 )
-                return got == needed
+                return got == total_needed
             return False
         finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
+            resp.close()
+
+    async def _fetch_parallel_net_segment(
+        self,
+        client_resp: web.StreamResponse,
+        entry: CacheEntry,
+        seg_s: int,
+        seg_e: int,
+        total_size: int,
+        upstream_headers: dict,
+        proxy_url: Optional[str],
+        tls_verify: bool,
+        timeout_sec: float,
+        existing_resp: Optional[aiohttp.ClientResponse] = None,
+        cold_part0_info: Optional[Tuple[bytes, int, int]] = None,
+    ) -> bool:
+        """Download large uncached spans across N concurrent aiohttp Range workers in sliding order."""
+        part_size = self.part_size
+        total_needed = seg_e - seg_s + 1
+
+        # Keep part 0 aligned to existing cold probe end if already opened
+        part0_end = cold_part0_info[2] if cold_part0_info is not None else min(seg_e, seg_s + part_size - 1)
+        part_bounds: List[Tuple[int, int]] = [(seg_s, part0_end)]
+        cur = part0_end + 1
+        while cur <= seg_e:
+            nxt = min(seg_e, cur + part_size - 1)
+            part_bounds.append((cur, nxt))
+            cur = nxt + 1
+
+        num_parts = len(part_bounds)
+        max_ahead = max(self.connections * 2, self.connections + 2)
+        cond = asyncio.Condition()
+        part_chunks: Dict[int, deque] = {}
+        part_done: Dict[int, bool] = {}
+        cur_idx = 0
+        next_idx = 0
+        stopped = False
+
+        if cold_part0_info is not None and cold_part0_info[0]:
+            part_chunks[0] = deque([cold_part0_info[0]])
+
+        async def download_part(idx: int, p_s: int, p_e: int, pre_resp: Optional[aiohttp.ClientResponse] = None) -> bool:
+            resp = pre_resp
+            read_start = cold_part0_info[1] if (idx == 0 and cold_part0_info is not None) else p_s
+            need_from_net = p_e - read_start + 1
+            if need_from_net <= 0:
+                if resp is not None:
+                    resp.close()
+                return True
+
+            for attempt in range(2):
+                if stopped:
+                    if resp is not None:
+                        resp.close()
+                    return False
+                if resp is None:
+                    rng = f"bytes={read_start}-{p_e}"
+                    try:
+                        resp = await self._fetch_upstream(
+                            "GET", entry.url, upstream_headers, proxy_url, tls_verify, timeout_sec, range_header=rng
+                        )
+                    except Exception:
+                        if attempt == 0:
+                            await asyncio.sleep(0.15)
+                            continue
+                        return False
+                try:
+                    if resp.status not in (200, 206):
+                        return False
+                    u_start = read_start
+                    to_skip = 0
+                    max_recv = need_from_net
+                    if resp.status == 206:
+                        cr = parse_content_range(resp.headers.get("Content-Range", ""))
+                        if cr:
+                            if cr[2] is not None and cr[2] != total_size:
+                                entry.invalidate()
+                                return False
+                            if cr[0] > read_start:
+                                return False
+                            u_start = cr[0]
+                            to_skip = read_start - u_start
+                            max_recv = min(cr[1] - u_start + 1, to_skip + need_from_net)
+                    elif resp.status == 200:
+                        u_start = 0
+                        to_skip = read_start
+                        max_recv = p_e + 1
+
+                    off, remaining, forwarded = u_start, max_recv, 0
+                    async for chunk in resp.content.iter_any():
+                        if stopped:
+                            return False
+                        if len(chunk) > remaining:
+                            chunk = chunk[:remaining]
+                        remaining -= len(chunk)
+                        entry.write_chunk(off, chunk)
+                        off += len(chunk)
+                        if to_skip >= len(chunk):
+                            to_skip -= len(chunk)
+                        else:
+                            out = chunk[to_skip:] if to_skip > 0 else chunk
+                            to_skip = 0
+                            forwarded += len(out)
+                            async with cond:
+                                part_chunks.setdefault(idx, deque()).append(out)
+                                cond.notify_all()
+                        if remaining <= 0:
+                            break
+                    if forwarded == need_from_net:
+                        return True
+                    read_start += forwarded
+                    need_from_net -= forwarded
+                except DISCONNECT_ERRORS + (asyncio.CancelledError,):
+                    return False
+                finally:
+                    resp.close()
+                    resp = None
+            return False
+
+        async def worker(first_resp: Optional[aiohttp.ClientResponse] = None) -> None:
+            nonlocal next_idx
+            my_pre = first_resp
+            while not stopped:
+                async with cond:
+                    while not stopped and next_idx < num_parts and next_idx >= cur_idx + max_ahead:
+                        await cond.wait()
+                    if stopped or next_idx >= num_parts:
+                        if my_pre is not None:
+                            my_pre.close()
+                        return
+                    my_idx = next_idx
+                    next_idx += 1
+                p_s, p_e = part_bounds[my_idx]
+                ok = await download_part(my_idx, p_s, p_e, my_pre if my_idx == 0 else None)
+                my_pre = None
+                async with cond:
+                    part_done[my_idx] = ok
+                    cond.notify_all()
+
+        n_workers = min(self.connections, num_parts)
+        workers = [
+            asyncio.create_task(worker(existing_resp if i == 0 else None))
+            for i in range(n_workers)
+        ]
+
+        try:
+            for idx in range(num_parts):
+                while True:
+                    async with cond:
+                        q = part_chunks.get(idx)
+                        while not stopped and (not q) and (idx not in part_done):
+                            await cond.wait()
+                            q = part_chunks.get(idx)
+                        batch = list(q) if q else []
+                        if q:
+                            q.clear()
+                        done_flag = part_done.get(idx)
+                    for chunk in batch:
+                        await client_resp.write(chunk)
+                    if done_flag is True:
+                        async with cond:
+                            part_chunks.pop(idx, None)
+                            part_done.pop(idx, None)
+                            cur_idx = idx + 1
+                            cond.notify_all()
+                        break
+                    if done_flag is False or stopped:
+                        return False
+            return True
+        except DISCONNECT_ERRORS + (asyncio.CancelledError,):
+            return False
+        finally:
+            stopped = True
+            async with cond:
+                cond.notify_all()
+            for t in workers:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            if existing_resp is not None and not existing_resp.closed:
+                existing_resp.close()
 
 
 def acquire_singleton_lock(lock_path: str):
@@ -1368,13 +1628,63 @@ def redirect_stdio(log_path: Optional[str]) -> None:
         pass
 
 
+async def run_server(args, manager: CacheManager, server_info_path: str) -> None:
+    proxy_srv = AsyncRangeProxy(manager, args.chunk_size, args.connections, args.part_size_kb)
+    await proxy_srv.start_session()
+    runner = web.AppRunner(proxy_srv.build_app(), access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", args.port, backlog=128)
+    await site.start()
+
+    actual_port = site._server.sockets[0].getsockname()[1]
+    proxy_srv.port = actual_port
+    _atomic_write_json(server_info_path, {"pid": os.getpid(), "port": actual_port, "started_at": time.time()})
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_stop(*_args):
+        try:
+            loop.call_soon_threadsafe(stop_event.set)
+        except Exception:
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, request_stop)
+        except Exception:
+            pass
+
+    watchdog_task = None
+    if args.idle_timeout > 0:
+        async def idle_watchdog():
+            while not stop_event.is_set():
+                await asyncio.sleep(5.0)
+                idle_for = time.monotonic() - proxy_srv.last_activity
+                if proxy_srv.active_requests == 0 and idle_for >= args.idle_timeout:
+                    stop_event.set()
+                    break
+        watchdog_task = asyncio.create_task(idle_watchdog())
+
+    try:
+        await stop_event.wait()
+    finally:
+        if watchdog_task is not None and not watchdog_task.done():
+            watchdog_task.cancel()
+        manager.flush_all()
+        await proxy_srv.close_session()
+        await runner.cleanup()
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="mpv HTTP 206 Range Cache Proxy")
+    parser = argparse.ArgumentParser(description="mpv Async HTTP 206 Range Cache Proxy")
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--idle-timeout", type=int, default=300)
     parser.add_argument("--max-cache-mb", type=int, default=0)
     parser.add_argument("--chunk-size", type=int, default=65536)
+    parser.add_argument("--connections", type=int, default=4)
+    parser.add_argument("--part-size-kb", type=int, default=2048)
     parser.add_argument("--flush-kb", type=int, default=1024)
     parser.add_argument("--ignore-params", default="")
     parser.add_argument("--no-match-by-content", action="store_true")
@@ -1392,39 +1702,14 @@ def main() -> int:
     manager = CacheManager(
         args.cache_dir, args.max_cache_mb, args.flush_kb, ignore_params, not args.no_match_by_content
     )
-    server = ProxyHTTPServer(("127.0.0.1", args.port), ProxyHandler, manager, max(8192, args.chunk_size))
     server_info_path = os.path.join(args.cache_dir, "server.json")
-    _atomic_write_json(server_info_path, {"pid": os.getpid(), "port": server.server_address[1], "started_at": time.time()})
-
-    shutdown_event = threading.Event()
-
-    def stop_server(*_args):
-        if not shutdown_event.is_set():
-            shutdown_event.set()
-            threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGINT, stop_server)
-    signal.signal(signal.SIGTERM, stop_server)
-
-    if args.idle_timeout > 0:
-        def idle_watchdog():
-            while not shutdown_event.wait(5.0):
-                with server.activity_lock:
-                    idle_for = time.monotonic() - server.last_activity
-                    active = server.active_requests
-                if active == 0 and idle_for >= args.idle_timeout:
-                    stop_server()
-                    break
-        threading.Thread(target=idle_watchdog, daemon=True).start()
 
     try:
-        server.serve_forever(poll_interval=0.5)
+        asyncio.run(run_server(args, manager, server_info_path))
+    except KeyboardInterrupt:
+        pass
     finally:
         manager.flush_all()
-        try:
-            server.server_close()
-        except Exception:
-            pass
         info = _read_json(server_info_path)
         if info and info.get("pid") == os.getpid():
             try:

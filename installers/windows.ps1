@@ -112,13 +112,13 @@ if (!(Test-Path -LiteralPath $ConfFile)) {
 $Py = Get-Command python -ErrorAction SilentlyContinue
 if (-not $Py) { $Py = Get-Command python3 -ErrorAction SilentlyContinue }
 if ($Py) {
-	& $Py.Source -c "import requests" 2>$null
+	& $Py.Source -c "import aiohttp" 2>$null
 	if ($LASTEXITCODE -ne 0) {
-		Write-Output "Note: Python 'requests' module missing. Install with: pip install requests"
+		Write-Output "Note: Python 'aiohttp' module missing. Install with: pip install aiohttp"
 	}
 }
 else {
-	Write-Output "Note: Python 3 not found in PATH. Install Python 3 + 'pip install requests' to run proxy.py."
+	Write-Output "Note: Python 3 not found in PATH. Install Python 3 + 'pip install aiohttp' to run proxy.py."
 }
 
 Write-Output "mpv-http-range-cache has been installed."

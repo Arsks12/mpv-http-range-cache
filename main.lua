@@ -10,6 +10,8 @@ local opts = {
     idle_timeout = 300,
     max_cache_size_mb = 0,
     chunk_size = 65536,
+    connections = 4,
+    part_size_kb = 2048,
     flush_interval_kb = 1024,
     ignore_query_params = "",
     match_by_content = true,
@@ -80,7 +82,7 @@ local function detect_python()
         return resolved_python
     end
     for _, cmd in ipairs(IS_WIN and { "pythonw", "python", "python3" } or { "python3", "python" }) do
-        local res = run_subproc({ cmd, "-c", "import requests; print('ok')" })
+        local res = run_subproc({ cmd, "-c", "import aiohttp; print('ok')" })
         if res and res.status == 0 and (res.stdout or ""):match("ok") then
             resolved_python = cmd
             return cmd
@@ -135,7 +137,7 @@ end
 local function spawn_proxy()
     local py = detect_python()
     if not py then
-        msg.error("Python with 'requests' not found; HTTP range caching disabled")
+        msg.error("Python with 'aiohttp' not found; HTTP range caching disabled")
         return false
     end
     local args = {
@@ -144,6 +146,8 @@ local function spawn_proxy()
         "--idle-timeout", tostring(opts.idle_timeout),
         "--max-cache-mb", tostring(opts.max_cache_size_mb),
         "--chunk-size", tostring(opts.chunk_size),
+        "--connections", tostring(opts.connections),
+        "--part-size-kb", tostring(opts.part_size_kb),
         "--flush-kb", tostring(opts.flush_interval_kb),
         "--ignore-params", opts.ignore_query_params or "",
     }

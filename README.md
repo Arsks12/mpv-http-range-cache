@@ -79,12 +79,12 @@ Think of `mpv-http-range-cache` as a tiny smart DVR sitting between `mpv` and th
      │         • sets file-local-options/http-proxy="" (bypass proxy on loopback)
      │         • rewrites stream-open-filename ─▶ http://127.0.0.1:<port>/stream?url=...
      ▼
-  proxy.py (127.0.0.1:<ephemeral-port>, singleton via proxy.lock)
+  proxy.py (127.0.0.1:<ephemeral-port>, async aiohttp server + ClientSession pool, singleton via proxy.lock)
      ├─ GET /__watch_later  ──▶ restores newest position across mirror URLs
      ├─ GET /stream         ──▶ plan_segments(cached_intervals, req_start, req_end)
-     │      ├─ "cache" span ──▶ pread from <cache_dir>/<file>/cache.data
-     │      └─ "net" span   ──▶ upstream GET Range (via X-Mpv-Cache-Proxy)
-     │                             └─ tee chunk ─▶ socket + sparse file + merge_intervals
+     │      ├─ "cache" span ──▶ async thread pread from <cache_dir>/<file>/cache.data
+     │      └─ "net" span   ──▶ sliding-window parallel Range workers (connections × part_size_kb)
+     │                             └─ ordered stream ─▶ client + sparse file + merge_intervals
      └─ POST /__watch_later ──▶ saves position on 15s tick & end-file (clears on EOF)
 ```
 
@@ -95,10 +95,10 @@ Think of `mpv-http-range-cache` as a tiny smart DVR sitting between `mpv` and th
 ### Requirements
 
 -   **mpv 0.33** or newer
--   **Python 3.8+** with [`requests`](https://pypi.org/project/requests/):
+-   **Python 3.8+** with [`aiohttp`](https://pypi.org/project/aiohttp/):
 
     ```sh
-    pip install requests
+    pip install aiohttp
     ```
 
 -   **Optional**: `curl` in `PATH` (used by Lua for sub-10ms control calls; automatically falls back to `python` `urllib.request` if absent).
@@ -163,6 +163,8 @@ All options live in `<mpv-config>/script-opts/http_range_cache.conf` (documented
 | `cache_dir` | Path (`~~` supported) | `~~/cache/http-range-cache` | Root folder containing per-file cache directories, `server.json`, `proxy.lock`, and optional `proxy.log`. |
 | `idle_timeout` | Seconds (`0` = never) | `300` | Auto-terminates `proxy.py` after N seconds with zero active HTTP requests. |
 | `max_cache_size_mb` | Megabytes (`0` = unlimited) | `0` | Soft LRU disk cap; oldest-accessed entries are deleted while protecting the active stream. |
+| `connections` | Integer | `4` | Concurrent upstream `Range` connections per missed network segment (`1`–`16`). |
+| `part_size_kb` | Kilobytes | `2048` | Byte-range chunk size fetched per parallel worker (`256`–`16384`). |
 | `chunk_size` | Bytes | `65536` | Read/write block size (`64 KB` default, minimum enforced `8192` bytes). |
 | `flush_interval_kb` | Kilobytes | `1024` | Writes `cache.meta.json` every N KB downloaded (also flushed whenever a connection finishes). |
 | `ignore_query_params` | Comma list | _(empty)_ | URL query keys stripped before key hashing (e.g. `token,sig,expires`). |
@@ -213,12 +215,13 @@ alt+t  script-binding http-range-cache/toggle-cache         #! Cache > Toggle ra
 -   Any incoming `X-Mpv-Cache-*` headers are sanitized before setting `X-Mpv-Cache-Proxy`, `X-Mpv-Cache-Tls-Verify`, and `X-Mpv-Cache-Timeout`.
 -   `on_load_fail` runs at **priority `5`** (earlier than `ytdl_hook` at `10`), restoring `stream-open-filename`, `file-local-options/http-proxy`, and `http-header-fields` if local proxy startup or upstream connection fails before playback begins.
 
-### Interval Merging, Segment Planning & Prefetching (`proxy.py`)
+### Interval Merging, Segment Planning & Parallel Range Fetching (`proxy.py`)
 
 -   Cached spans are stored as sorted disjoint inclusive intervals `[[start, end], ...]`. Every write merges touching/overlapping spans in $O(k)$ via `merge_intervals`.
 -   For an incoming client request `[req_start, req_end]`, `plan_segments` emits a minimal alternating sequence of `("cache", s, e)` and `("net", s, e)` segments.
--   If `segments[0]` requires network (`"net"`), the proxy **opens the upstream connection before committing client response headers**, allowing genuine HTTP errors (`403`, `404`, `502`) to propagate cleanly instead of truncating a fake `200`/`206` body.
--   Incoming client disconnects (`BrokenPipeError`, `ConnectionResetError`, `ConnectionAbortedError`, `OSError`) are trapped gracefully without corrupting already-written upstream chunks.
+-   Network spans run through an async `aiohttp` sliding-window parallel downloader (`_fetch_parallel_net_segment`): splits `[s, e]` into `part_size_kb` parts across up to `connections` concurrent workers sharing a pooled `aiohttp.ClientSession` (keep-alive + DNS cache), writes each part at its exact sparse offset immediately on arrival, and streams parts in order to `mpv`. On cold start, the first `part_size_kb` probe hands its already-open stream directly into part 0 without a duplicate request.
+-   If `segments[0]` requires network (`"net"`), the proxy **opens the upstream probe before committing client response headers**, allowing genuine HTTP errors (`403`, `404`, `502`) to propagate cleanly instead of truncating a fake `200`/`206` body.
+-   Incoming client disconnects (`ConnectionResetError`, `ClientConnectionResetError`, `CancelledError`, `OSError`) are trapped gracefully without corrupting already-written upstream chunks.
 -   Upstream requests force `Accept-Encoding: identity` and strip hop-by-hop headers (`HOP_BY_HOP_HEADERS`) + internal `X-Mpv-Cache-*` headers so byte offsets on disk always stay 1:1 with the wire stream.
 
 ### Content Deduplication & `watch_later` Sync
@@ -313,9 +316,9 @@ Two things happen on Windows:
 1. Windows Explorer caches directory entry sizes while a write handle remains open. Once `mpv` closes connections (`_active_users == 0`), [`proxy.py`](proxy.py) flushes buffers and closes `cache.data`, and Explorer immediately reflects the true byte span.
 2. `cache.data` is marked **sparse** (`FSCTL_SET_SPARSE`), so *Size* reflects the highest written byte offset while *Size on disk* reflects only actual cached chunks.
 
-#### Why does this use Python + `requests` instead of pure `mpv` Lua?
+#### Why does this use Python + `aiohttp` instead of pure `mpv` Lua?
 
-`mpv`'s embedded Lua sandbox has no non-blocking HTTP server sockets, thread-pooled upstream connections, or Win32 `DeviceIoControl` sparse-file calls. Offloading HTTP range splicing and sparse disk I/O to a tiny localhost process (`proxy.py`) lets `mpv` keep using its native `ffmpeg` demuxer cache and fast seeks untouched.
+`mpv`'s embedded Lua sandbox has no async HTTP server sockets, pooled multi-connection `Range` downloaders, or Win32 `DeviceIoControl` sparse-file calls. Offloading HTTP range splicing, parallel part fetching, and sparse disk I/O to a tiny localhost `aiohttp` process (`proxy.py`) lets `mpv` keep using its native `ffmpeg` demuxer cache and fast seeks untouched.
 
 #### What happens if `http-proxy` is set in my `mpv.conf`?
 
