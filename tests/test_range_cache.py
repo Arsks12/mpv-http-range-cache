@@ -68,7 +68,14 @@ def test_unit_helpers(tmp: str):
     ]
     assert proxy.canonical_url("http://x/v.mkv?token=abc&id=1", {"token"}) == "http://x/v.mkv?id=1"
     assert proxy.extract_safe_dirname("http://x/a/b/CON.mkv") == "_CON.mkv"
-    d = proxy.extract_safe_dirname(f"http://x/{'a' * 130}.mkv")
+    long_url = (
+        "https://example.workers.dev/api/download/"
+        "Gintama.S07E27.Style.Goes.Out.of.Fashion.the.Moment.It.s.Put.Into.Words."
+        "There.Are.Two.Types.of.People.In.This.World.Those.Who.Yell.Out.Their.Attack.Names."
+        "and.Those.Who.Don.t.1080p.AMZN.WEB-DL.Dual.Audio.AAC.2.0.H264-XtRoN.mkv"
+        "?id=15rJ2BOYuxWgY350Yuo4f9okYZs5liDOY&sig=e4ee0c93"
+    )
+    d = proxy.extract_safe_dirname(long_url)
     assert len(d) <= 110 and d.endswith(".mkv")
 
     cdir = os.path.join(tmp, "unit_cache")
@@ -282,6 +289,7 @@ def test_mpv_integration(tmp: str):
         "mpv", "--no-config", "--vo=null", "--ao=null", "--ytdl=no", "--untimed",
         "--force-window=no", "--osc=no", "--terminal=no", "--idle=no",
         "--cache=yes", "--demuxer-max-bytes=50MiB", "--save-position-on-quit=yes",
+        "--http-header-fields=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         f"--watch-later-directory={wl_dir}",
         f"--script={MAIN_LUA}",
         f"--script-opts=http_range_cache-cache_dir={cdir},http_range_cache-idle_timeout=30,http_range_cache-show_osd=no,http_range_cache-match_by_content=yes,http_range_cache-connections=4,http_range_cache-part_size_kb=256",

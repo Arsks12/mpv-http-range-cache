@@ -265,8 +265,22 @@ mp.add_hook("on_load", 50, function(hook)
         local orig_proxy = mp.get_property("http-proxy") or ""
         local orig_hdrs = mp.get_property_native("http-header-fields") or {}
         local new_hdrs = {}
-        for _, h in ipairs(orig_hdrs) do
-            if type(h) == "string" and not h:lower():match("^x%-mpv%-cache%-") then table.insert(new_hdrs, h) end
+        local skip_cont = false
+        for _, raw_h in ipairs(orig_hdrs) do
+            if type(raw_h) == "string" then
+                local h = raw_h:gsub("[\r\n]", "")
+                local name = h:match("^([^:]+):")
+                local is_hdr = name ~= nil and not name:match("[%s=]") and not h:match("^[^:]+://")
+                if is_hdr then
+                    skip_cont = h:lower():match("^x%-mpv%-cache%-") ~= nil
+                    if not skip_cont then
+                        table.insert(new_hdrs, h)
+                    end
+                elseif not skip_cont and #new_hdrs > 0 and h ~= "" then
+                    -- Rejoin fragments split on ',' by mpv's string-list parser (e.g. "KHTML, like Gecko")
+                    new_hdrs[#new_hdrs] = new_hdrs[#new_hdrs] .. "," .. h
+                end
+            end
         end
         if orig_proxy ~= "" then table.insert(new_hdrs, "X-Mpv-Cache-Proxy: " .. orig_proxy) end
         if not mp.get_property_bool("tls-verify", true) then table.insert(new_hdrs, "X-Mpv-Cache-Tls-Verify: 0") end
