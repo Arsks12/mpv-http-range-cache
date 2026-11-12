@@ -163,7 +163,7 @@ All options live in `<mpv-config>/script-opts/http_range_cache.conf` (documented
 | `cache_dir` | Path (`~~` supported) | `~~/cache/http-range-cache` | Root folder containing per-file cache directories, `server.json`, `proxy.lock`, and optional `proxy.log`. |
 | `idle_timeout` | Seconds (`0` = never) | `300` | Auto-terminates `proxy.py` after N seconds with zero active HTTP requests. |
 | `max_cache_size_mb` | Megabytes (`0` = unlimited) | `0` | Soft LRU disk cap; oldest-accessed entries are deleted while protecting the active stream. |
-| `connections` | Integer | `4` | Concurrent upstream `Range` connections per missed network segment (`1`–`16`). |
+| `connections` | Integer | `4` | Concurrent upstream `Range` connections per missed network segment (`1`–`32`). |
 | `part_size_kb` | Kilobytes | `2048` | Byte-range chunk size fetched per parallel worker (`256`–`16384`). |
 | `chunk_size` | Bytes | `65536` | Read/write block size (`64 KB` default, minimum enforced `8192` bytes). |
 | `flush_interval_kb` | Kilobytes | `1024` | Writes `cache.meta.json` every N KB downloaded (also flushed whenever a connection finishes). |

@@ -834,8 +834,9 @@ class AsyncRangeProxy:
     def __init__(self, manager: CacheManager, chunk_size: int = 65536, connections: int = 4, part_size_kb: int = 2048):
         self.manager = manager
         self.chunk_size = max(8192, chunk_size)
-        self.connections = max(1, min(16, connections))
+        self.connections = max(1, min(32, connections))
         self.part_size = max(262144, part_size_kb * 1024)
+        self.write_batch_size = max(262144, min(1048576, self.part_size))
         self.active_requests = 0
         self.last_activity = time.monotonic()
         self.port = 0
@@ -845,8 +846,8 @@ class AsyncRangeProxy:
         if self.session is not None and not self.session.closed:
             return
         connector = aiohttp.TCPConnector(
-            limit=max(64, self.connections * 8),
-            limit_per_host=max(32, self.connections * 4),
+            limit=max(128, self.connections * 8),
+            limit_per_host=max(64, self.connections * 4),
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
             keepalive_timeout=60.0,
@@ -855,7 +856,7 @@ class AsyncRangeProxy:
             connector=connector,
             auto_decompress=False,
             cookie_jar=aiohttp.DummyCookieJar(),
-            read_bufsize=262144,
+            read_bufsize=1048576,
         )
 
     async def close_session(self) -> None:
@@ -1265,6 +1266,8 @@ class AsyncRangeProxy:
         skip_leading: int = 0,
     ) -> int:
         offset, forwarded, remaining, to_skip = start_offset, 0, max_bytes, skip_leading
+        write_off = start_offset
+        write_buf = bytearray()
         try:
             async for chunk in up_resp.content.iter_any():
                 if remaining is not None:
@@ -1273,8 +1276,12 @@ class AsyncRangeProxy:
                     if len(chunk) > remaining:
                         chunk = chunk[:remaining]
                     remaining -= len(chunk)
-                await asyncio.to_thread(entry.write_chunk, offset, chunk)
+                write_buf.extend(chunk)
                 offset += len(chunk)
+                if len(write_buf) >= self.write_batch_size:
+                    await asyncio.to_thread(entry.write_chunk, write_off, bytes(write_buf))
+                    write_off += len(write_buf)
+                    write_buf.clear()
                 if to_skip >= len(chunk):
                     to_skip -= len(chunk)
                     continue
@@ -1286,6 +1293,9 @@ class AsyncRangeProxy:
                     break
         except DISCONNECT_ERRORS + (asyncio.CancelledError,):
             pass
+        finally:
+            if write_buf:
+                await asyncio.to_thread(entry.write_chunk, write_off, bytes(write_buf))
         return forwarded
 
     async def _serve_known_range(
@@ -1471,7 +1481,7 @@ class AsyncRangeProxy:
             cur = nxt + 1
 
         num_parts = len(part_bounds)
-        max_ahead = max(self.connections * 2, self.connections + 2)
+        max_ahead = max(self.connections * 3, self.connections + 4)
         cond = asyncio.Condition()
         part_chunks: Dict[int, deque] = {}
         part_done: Dict[int, bool] = {}
@@ -1530,25 +1540,36 @@ class AsyncRangeProxy:
                         max_recv = p_e + 1
 
                     off, remaining, forwarded = u_start, max_recv, 0
-                    async for chunk in resp.content.iter_any():
-                        if stopped:
-                            return False
-                        if len(chunk) > remaining:
-                            chunk = chunk[:remaining]
-                        remaining -= len(chunk)
-                        await asyncio.to_thread(entry.write_chunk, off, chunk)
-                        off += len(chunk)
-                        if to_skip >= len(chunk):
-                            to_skip -= len(chunk)
-                        else:
-                            out = chunk[to_skip:] if to_skip > 0 else chunk
-                            to_skip = 0
-                            forwarded += len(out)
-                            async with cond:
-                                part_chunks.setdefault(idx, deque()).append(out)
-                                cond.notify_all()
-                        if remaining <= 0:
-                            break
+                    write_off = u_start
+                    write_buf = bytearray()
+                    try:
+                        async for chunk in resp.content.iter_any():
+                            if stopped:
+                                return False
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
+                            remaining -= len(chunk)
+                            write_buf.extend(chunk)
+                            off += len(chunk)
+                            if len(write_buf) >= self.write_batch_size:
+                                await asyncio.to_thread(entry.write_chunk, write_off, bytes(write_buf))
+                                write_off += len(write_buf)
+                                write_buf.clear()
+                            if to_skip >= len(chunk):
+                                to_skip -= len(chunk)
+                            else:
+                                out = chunk[to_skip:] if to_skip > 0 else chunk
+                                to_skip = 0
+                                forwarded += len(out)
+                                async with cond:
+                                    part_chunks.setdefault(idx, deque()).append(out)
+                                    if idx == cur_idx:
+                                        cond.notify_all()
+                            if remaining <= 0:
+                                break
+                    finally:
+                        if write_buf:
+                            await asyncio.to_thread(entry.write_chunk, write_off, bytes(write_buf))
                     if forwarded == need_from_net:
                         return True
                     read_start += forwarded
