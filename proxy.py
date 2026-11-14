@@ -29,6 +29,10 @@ FSCTL_SET_SPARSE = 0x000900C4
 HEAD_HASH_BYTES = 65536
 DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError, aiohttp.ClientConnectionError)
 
+# Hardcoded upstream proxy configuration
+USE_PROXY = True
+PROXY_URL = "http://okbro:okbro@159.195.111.157:59991"
+
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "accept-encoding",
@@ -907,6 +911,17 @@ class AsyncRangeProxy:
                     pass
             elif not kl.startswith("x-mpv-cache-") and kl not in HOP_BY_HOP_HEADERS:
                 upstream_headers[k] = v
+
+        if USE_PROXY and PROXY_URL:
+            is_local = False
+            if target_url:
+                try:
+                    h = (urllib.parse.urlsplit(target_url).hostname or "").lower()
+                    is_local = h in ("localhost", "::1", "[::1]") or h.startswith("127.")
+                except Exception:
+                    pass
+            if not is_local:
+                proxy_url = PROXY_URL
 
         upstream_headers["Accept-Encoding"] = "identity"
         return target_url, upstream_headers, proxy_url, tls_verify, timeout_sec
